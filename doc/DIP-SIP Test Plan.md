@@ -1,4 +1,3 @@
-
 # DIP-SIP Test Plan
 
 ### Table of Contests:
@@ -32,8 +31,9 @@ The test is targeting a running SONiC system, with basic setup configuration, in
 
 #### Testbed
 
-**Supported topologies:** 
-t0, t0-16, t0-56, t0-64, t0-64-32, t0-116, t1, t1-lag t1-64-lag, t1-64-lag-clet.
+*Supported topologies:*
+
+t0, t1, t1-lag.
 
 
 ## Test Cases
@@ -46,6 +46,7 @@ IPs, src-dst ports).
 Testcase will pass successfully if packet is routed between router interfaces. 
 
 ## Execution Example:
+```ini
+py.test --inventory ../ansible/inventory --host-pattern <host_name> --module-path ../ansible/library/ --testbed <host_name>-<topology> --testbed_file ../ansible/testbed.csv --show-capture=no --capture=no --log-cli-level debug -ra -vvvvv dip_sip/test_dip_sip.py
 
-`py.test --inventory ../ansible/inventory --host-pattern <host_name> --module-path ../ansible/library/ --testbed <host_name>-<topology> --testbed_file ../ansible/testbed.csv --show-capture=no --capture=no --log-cli-level debug -ra -vvvvv dip_sip/test_dip_sip.py`
-
+```
