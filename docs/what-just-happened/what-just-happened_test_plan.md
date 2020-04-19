@@ -16,45 +16,76 @@ what-just-happened is a feature intended to track lost packets and display the d
 The purpose of this test is:
 
 1. Check that wrong packets are dropped. 
-2. Check that the description in 'show what-just-happened' command output suits the dropped packet.
+2. Check that the description in ```show what-just-happened``` command output suits the dropped packet.
  
 The test will focus on L2, L3 raw packets drops. 
 
 The implementation will be done using PyTest framework.
 
 ## Pre test
-Before all test cases execution, the test should check whether what-just-happened feature is available and enabled. 
+Before all test cases execution:
 
-For this purpose, a pre test fixture will do the following:
+1. The test should check whether what-just-happened feature is available and enabled. 
 
-- Execute ```show feature``` command on DUT. 
-- Parse output table.
-- Check if 'what-just-happened' appears in the table (availability), and if it is enabled.
+    For this purpose, an ansible module named "feature_facts" will be implemented doing the following:
 
-```bash
-Feature             Status
-------------------  --------
-telemetry           enabled
-sflow               disabled
-what-just-happened  enabled
-```
+    - Execute ```show feature``` command on DUT. 
+    - Parse output table:
+        ```bash
+        Feature             Status
+        ------------------  --------
+        telemetry           enabled
+        sflow               disabled
+        what-just-happened  enabled
+        ```
+    - Return a dictionary contains feature_name - enabled/disabled as key - value.
+2. The test needs to verify that debug mode is enabled. 
 
-- If one of the checks on previous phase is indicated what-just-happened as not available, skip the test. 
+    A pre test function named "get_global_configuration()" will do the following:
+    - Execute ```show what-just-happened configuration global``` command on DUT.
+    - Parse output table:
+        ```bash
+        Mode      PCI Bandwidth (%)    Nice Level
+        ------  -------------------  ------------
+        debug                    50             1
+        ```
+    - Return the enabled modes. 
+
+3. The test should check on what channels WJH is enabled. 
+
+    A pre test fixture named "get_channel_configuration()" will do the following:
+    - Execute ```show what-just-happened configuration channels``` command on DUT. 
+    - Parse output table:
+        ```bash
+        Channel     Type    Polling Interval (s)    Drop Groups
+        ----------  ------  ----------------------  -------------
+        forwarding  raw     N/A                     L2,L3,Tunnel
+        ```
+    - Return the drop groups.
+
+A pre test fixture will do the following:
+- Call "feature_facts" module and check if 'what-just-happened' appears in the table (availability), and if it is enabled.
+- Call get_global_configuration() function and check that debug mode is enabled.
+- If one of the checks on previous phases failed, skip the test.
+
+
+
 
 ## Test plan
 
 ### Overview
-The test will use test cases appear in a file named drop_packets.py.
+The test will use test cases that appear in a file named drop_packets.py, which will be shared with test_drop_counters.py file.
+- test_drop_counters.py sends wrong packets and checks that the right counter (e.g. L2, L3) is incremented. 
+- test_what_just_happened.py sends wrong packets and checks that the drop reason appears in what-just-happened table. 
 
-This file contains creation of packets intend to drop.
 
-for example: 
+For example: 
 
 ```test_equal_smac_dmac_drop``` function, generates a TCP packet which equal source mac and destination mac addresses.
 
 After each test case generates the packet, it calls do_test() function which implemented inside test_what_just_happened.py file. 
 
-do_test() function will send the packet, check if packet indeed dropped, and parse the output of 'show what-just-happened' command. 
+do_test() function will send the packet, check if packet indeed dropped, and parse the output of 'show what-just-happened' command.
 
 the output should suit to the packet in all table entries, e.g. src_ip, dst_ip, src_mac etc. 
 
@@ -68,10 +99,19 @@ For example, a packet which destination ip address is loopback:
                                                                                                                                                                          was received from the peer                      
 ```
 
+NOTE: 
+- In case what-just-happened test will need to drop additional packets which drop_counters won't need, the test cases will be written in test_what_just_happened.py file. 
+- Backround traffic can run during the test execution and will not harm the results, as long as the number of packets lost is smaller than 100 - the number of entries in table. 
+
+
+
 ### Test Cases
 -------------------
 
+Before test cases executions, the test will use the output of get_channel_configuration() fixture to make sure the drops can be catched by WJH daemon. 
+
 #### L2 Drops:
+
 - #### test_equal_smac_dmac_drop
     Create a packet with equal SMAC and DMAC and verify it is dropped.
 
@@ -125,7 +165,7 @@ For example, a packet which destination ip address is loopback:
 - #### test_ip_pkt_with_expired_ttl
     Create an IP packet with TTL=0 and verify it is dropped.
 
-- #### test_non_routable_igmp_pkts - NEEDED?
+- #### test_non_routable_igmp_pkts
     Create IGMP non-routable packets and verify they are dropped by DUT. 
 
 - #### test_absent_ip_header
