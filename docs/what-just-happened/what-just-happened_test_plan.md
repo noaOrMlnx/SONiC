@@ -75,17 +75,38 @@ A pre test fixture will do the following:
 
 ### Overview
 The test will use test cases that appear in a file named drop_packets.py, which will be shared with test_drop_counters.py file.
-- test_drop_counters.py sends wrong packets and checks that the right counter (e.g. L2, L3) is incremented. 
-- test_what_just_happened.py sends wrong packets and checks that the drop reason appears in what-just-happened table. 
 
-
-For example: 
-
+e.g, 
 ```test_equal_smac_dmac_drop``` function, generates a TCP packet which equal source mac and destination mac addresses.
 
-After each test case generates the packet, it calls do_test() function which implemented inside test_what_just_happened.py file. 
+test_drop_counters.py sends wrong packets and checks that the right counter (e.g. L2, L3) is incremented. 
+test_what_just_happened.py sends wrong packets and checks that the drop reason appears in what-just-happened table. 
 
-do_test() function will send the packet, check if packet indeed dropped, and parse the output of 'show what-just-happened' command.
+Each of the above files will contain do_test() fixture.
+The fixture will return a pointer to the proper function.
+
+After each test case generates the packet in drop_packets.py file, it calls do_test() function which implemented inside the caller test file. 
+
+do_test() inner function will send the packet, check if packet indeed dropped, and parse the output of 'show what-just-happened' command.
+
+```python
+# test_what_just_happened.py file:
+@pytest.fixture(scope='module')
+def do_test(packet):
+    def wjh_test(packet):
+        # send packet
+        # verify packet is dropped
+        # verify wjh table is correct
+
+    return wjh_test
+```
+
+```python
+# drop_packets.py file:
+def test_equal_smac_dmac_drop(do_test):
+    # generate a packet 
+    do_test(packet)
+```
 
 the output should suit to the packet in all table entries, e.g. src_ip, dst_ip, src_mac etc. 
 
@@ -102,7 +123,6 @@ For example, a packet which destination ip address is loopback:
 NOTE: 
 - In case what-just-happened test will need to drop additional packets which drop_counters won't need, the test cases will be written in test_what_just_happened.py file. 
 - Backround traffic can run during the test execution and will not harm the results, as long as the number of packets lost is smaller than 100 - the number of entries in table. 
-
 
 
 ### Test Cases
