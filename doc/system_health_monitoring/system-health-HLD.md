@@ -55,6 +55,9 @@ By default any service is not in expected status will be considered as fault con
 
 -  Any fan is missing/broken
 -  Fan speed is lower than minimal value
+-  Fan direction is not expected
+    - For a running switch, all fan direction must be the same
+    - Fan direction with 'N/A' or none will be ignored
 -  PSU power voltage is out of range
 -  PSU temperature is higher than threshold
 -  PSU is in bad status
@@ -77,8 +80,10 @@ The filter string is case sensitive. Currently, it support following filters:
 - asic: ignore all ASIC check
 - fan: ignore all fan check
 - fan.speed: ignore fan speed check
+- fan.direction: ignore fan direction check
 - <fan_name>: ignore check for a specific fan
 - <fan_name>.speed: ignore speed check for a specific fan
+- <fan_name>.direction: ignore direction check for a specific fan
 - psu: ignore all PSU check
 - psu.temperature: ignore temperature check for all PSUs
 - psu.voltage: ignore voltage check for all PSUs
@@ -125,16 +130,16 @@ The configuration shall be:
 }
 ```
 
-### 1.5 system status LED color definition
+### 1.5 System status LED color definition
 
-default system status LED color definition is like
+System status LED is set based on the status of system. The system status is defined as following
 
- | Color            |     Status    |       Description       |
- |:----------------:|:-------------:|:-----------------------:|
- | Off              |  off          |   no power              |
- | Blinking amber   |  boot up      |   switch is booting up  |
- | Red              |  fault        |   in fault status       |
- | Green            |  Normal       |   in normal status      |
+ | Status           | Led Color            | Description                                                               |
+ |:----------------:|:--------------------:|:-------------------------------------------------------------------------:|
+ | booting          | ${led_color.booting} | System up time is less that 5 mins and not all services/devices are ready |
+ | normal           | ${led_color.normal}  | All services/devices are in good state                                    |
+ | fault            | ${led_color.fault}   | Not all services/devices are in good state                                |
+
 
 Considering that different vendors platform may have different LED color capability, so LED color for different status also configurable:
 
@@ -148,8 +153,15 @@ Considering that different vendors platform may have different LED color capabil
 }
 ```
 
-The field "booting" is deprecated because there is no booting stage anymore. For backward compatible, user can still configure this field but it won't take effect.
+If not configuration is provided, default configuration is used:
 
+```python
+DEFAULT_LED_CONFIG = {
+	'fault': 'red',
+	'normal': 'green',
+	'booting': 'red'
+}
+```
 
 ## 2. System health monitor service business logic
 
@@ -207,20 +219,23 @@ To have system status LED can be set by this new service, a system status LED ob
 psud need to collect more PSU data to the DB to satisfy the requirement of this new service. more specifically, psud need to collect psu output voltage, temperature and their threshold.
 
 	; Defines information for a psu
-	key                     = PSU_INFO|psu_name              ; information for the psu
-	; field                 = value
-	presence                = BOOLEAN                        ; presence of the psu
-	model                   = STRING                         ; model name of the psu
-	serial                  = STRING                         ; serial number of the psu
-	status                  = BOOLEAN                        ; status of the psu
-	change_event            = STRING                         ; change event of the psu
-	fan                     = STRING                         ; fan_name of the psu
-	led_status              = STRING                         ; led status of the psu
-	temp                    = INT                            ; temperature of the PSU
-	temp_th                 = INT                            ; temperature threshold
-	voltage                 = INT                            ; output voltage of the PSU
-	voltage_max_th          = INT                            ; max threshold of the output voltage
-	voltage_min_th          = INT                            ; min threshold of the output voltage
+	key                               = PSU_INFO|psu_name              ; information for the psu
+	; field                           = value
+	presence                          = BOOLEAN                        ; presence of the psu
+	model                             = STRING                         ; model name of the psu
+	serial                            = STRING                         ; serial number of the psu
+	status                            = BOOLEAN                        ; status of the psu
+	change_event                      = STRING                         ; change event of the psu
+	fan                               = STRING                         ; fan_name of the psu
+	led_status                        = STRING                         ; led status of the psu
+	temp                              = INT                            ; temperature of the PSU
+	temp_th                           = INT                            ; temperature threshold
+	voltage                           = INT                            ; output voltage of the PSU
+	voltage_max_th                    = INT                            ; max threshold of the output voltage
+	voltage_min_th                    = INT                            ; min threshold of the output voltage
+	power_overload                    = "true" / "false"               ; whether the PSU's power exceeds the threshold
+	power_warning_suppress_threshold  = 1*4.3DIGIT                     ; The power warning threshold
+	power_critical_threshold          = 1*4.3DIGIT                     ; The power critical threshold
 
 ## 5. System health monitor CLI
 
@@ -275,6 +290,7 @@ When something is wrong
         orchagent is not running
 	Hardware           Fault
         PSU 1 temp 85C and threshold is 70C
+        PSU 1 power (66.32w) exceeds the threshold (60.00w)
         FAN 2 is broken
 
 for the "detail" sub command output, it will give out all the services and devices status which is under monitoring, and also the ignored service/device list will also be displayed.
@@ -289,7 +305,9 @@ Fault condition and CLI output string table
  | critical service failure|[service name] is [service status]|
  | Any fan is missing/broken   |[FAN name] is missing/broken|
  | Fan speed is below minimal range|[FAN name] speed is lower than expected|
+ | Fan direction is wrong|[FAN name] direction [value] is not aligned with [FAN name] direction [value]|
  | PSU power voltage is out of range|[PSU name] voltage is out of range|
+ | PSU power exceeds threshold|[PSU name] power exceeds threshold|
  | PSU temp is too hot|[PSU name] is overheated|
  | PSU is in bad status|[PSU name] is broken|
  | ASIC temperature is too hot|[ASIC name] is overheated|
