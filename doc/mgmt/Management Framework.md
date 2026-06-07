@@ -735,7 +735,7 @@ Supported RPC Operations:
 
 Example Client Operations:
 --------------------------
-Using opensource clients, these are example client operations. The .json test payload files are available here: https://github.com/project-arlo/sonic-mgmt-common/tree/master/src/Translib/test
+Using opensource clients, these are example client operations. The .json test payload files are available here: https://github.com/sonic-net/sonic-mgmt-common/tree/master/translib/test
 
 Get:
 ----
@@ -1469,6 +1469,292 @@ Notes:
     1. SetEntry(), CreateEntry(), ModEntry() with empty fields in v, will map to
        DeleteEntry(). [ There may be an option to disable this in the future. ]
 
+####### 3.2.2.6.5.1 Config Session Changes
+
+Currently, the main task of the database as mentioned in [Management Framework] under the [DB Access Layer] section is to implement a wrapper over the go-redis package and enhance the functionality in the following ways:
+
+* Provide a sonic-py-swsssdk like API in Go
+
+* Enable support for concurrent access via Redis CAS (Check-And-Set) transactions.
+
+* Invoke the CVL for validation before write operations to the Redis DB
+
+This will be enhanced for the following:
+
+* Provide a way for querying a *candidate-datastore*, instead of the redis server's CONFIG_DB database selection. This can be supported in one of several ways:
+
+  - [ ] Use a different database number for CONFIG_DB than the one specified by the default (4, per the default database_config.json) on the redis-server for querying a *candidate-datastore*. This will require additional changes to the database docker (to support additional database numbers), and more memory resources (the CONFIG_DB is essentially duplicated). Increasing the number of supported *candidate-datastore* 's may result in an additional duplication of the memory resources, since each *candidate-datastore* will have to be implemented as a separate database number on the redis-server.
+
+  - [x] Use the existing behavior of the DB Access Layer (with the recent support added for reflecting the CAS Transaction cache in Get queries on a DB connection, by checking the CAS Transaction cache before returning entries to the caller). No additional resources (like memory) are needed.
+
+* Provide a way for querying the *running-datastore*. This is already supported in the Management Framework as in the current, and past SONiC releases, by opening a new DB Access Layer connection.
+
+* Nested transactions will be used to mark the beginning and end of each request. This is to be used to rollback the state of the Config Session in case a Set/CRUD request results in a failure. Any changes in the current Set/CRUD request need to be rolled back, but changes made by previous Set/CRUD requests in the same Config Session need to be preserved.
+
+| API       | Description                                                     |
+|:----------|-----------------------------------------------------------------|
+|           |                                                                 |
+|DeclareSP  | Define the Savepoint                                            |
+|           |                                                                 |
+|ReleaseSP  | Destroys the Savepoint                                          |
+|           |                                                                 |
+|Rollback2SP| Roll back all commands executed after the Savepoint             |
+|           |                                                                 |
+
+* Keep a count of the Transaction size, i.e. the number of redis operations that are pending commit in the *candidate-configuration*.
+
+######## 3.2.2.6.5.1.1 Locking
+
+* Synchronize *configure-session*, *configure-terminal*, and CRUD/Set/Write operations from non-KLISH clients (RESTCONF, gNMI). Thus, while a *configure-session* remains active, all other KLISH CLI, RESTCONF, and gNMI requests for Set will be disallowed/rejected indicating that a Resource is Locked, or a similar error message. Redis provides a locking mechanism through the use of *SETNX* command, which sets a key only if the value does not exist. Redis locking will be the preferred choice.
+
+* Exclusive *configure-session* behavior, i.e. only one KLISH session can be in the un-named *configure-session* at a time. This should be able to detect cases where a KLISH session has exited out of a *configure-session* either due to explicit admin command *exit*, or implicitly if the KLISH session was terminated due to connectivity issues, or an idle-timeout.
+
+* Synchronize access to the *candidate-datastore* DB connection. Multiple go-routines/threads can make DB Layer calls using that DB connection because:
+
+  - Config Session KLISH CLI could be making Set/CRUD requests.
+  - Another admin session could be requesting `show config session diff`
+  - Another admin session could be requesting `clear config session`
+
+######## 3.2.2.6.5.1.2 Transaction Size Limit
+
+Each KLISH CLI *configure-session* command can result in one or more redis commands being added to the *candidate-datastore*. The size of the redis commands in the *candidate-datastore* will be limited to ccDbTxCmdsLim (currently 10000).
+
+######## 3.2.2.6.5.1.3 DB Stretch Goal
+
+* Provide a way for querying an arbitrary datastore, as specified by either a *snapshot*, a *commit-id*, or a *target-datastore* specified in the form of a json (or equivalent format) file. Some Restrictions:
+
+  + IsWriteDisabled is true.
+  + IsOnChangeCache, and IsCacheEnabled are false.
+  + ScanCursor, PubSubRpcDB are not supported.
+  + Only CONFIG_DB-like datastores supported.
+  + Statistics (only some of which are applicable, i.e. no PCC (per-connection-cache)) may be recorded under a alternate DB no (internally known as PSEUDO_DB)
+
+###### 3.2.2.6.6 Config Session State
+
+The ConfigSession Object is created in Translib to manage the lifetime of a KLISH *configure session*. It is only supported for KLISH clients.
+
+Following are some of fields in this object:
+
+- name: Name of the Config Session (Future Release)
+
+- token: Unique Session Token
+
+- state: Config Session State
+
+- username: Name of the User
+
+- pid: The identifying PID of the KLISH Config Session
+
+
+Following is a set of tables which represents the state transitions for the ConfigSession Object in translib.
+
+
+#### cs_STATE_None
+
+Initially the ConfigSession Object is in the *None* state. Upon receipt of the internal ConfigSessionStart(OrResume) RPC, a transition is made to the *ACTIVE* state, and the actions under "Entry Action" column are executed.
+
+Table: cs_STATE_None
+
+
+|   RPC    |     Conditions    |    State    |       Entry Action             |
+|:---------|:-----------------:|:------------|:------------------------------:|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Start   |                   |   ACTIVE    |                                |
+|          |                   |             | c = NewConfigSession()         |
+|          |                   |             |                                |
+|          |                   |             | c.name = req.Name              |
+|          |                   |             | c.token = token.Generate()     |
+|          |                   |             | c.username = req.User          |
+|          |                   |             | c.cInfo.pid = req.CInfo.Pid    |
+|          |                   |             |                                |
+|          |                   |             | c.ccDB = NewDB()               |
+|          |                   |             | c.ccDB.StartTx()               |
+|          |                   |             |                                |
+|          |                   |             | rsp.Token = c.Token            |
+|          |                   |             | rsp.Status = CreatedSession    |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|   Exit   |                   |    None     | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Abort   |                   |    None     | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Commit  |                   |    None     | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|   Kill   |                   |    None     | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+
+
+
+#### cs_STATE_ACTIVE
+
+Once in the *ACTIVE* state, transitions can be made to *INACTIVE*, or *None*, or back to *ACTIVE*.
+
+Table: cs_STATE_ACTIVE
+
+|   RPC    |     Conditions    |    State    |       Entry Action             |
+|:---------|:-----------------:|:------------|:------------------------------:|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Start   |                   |             |                                |
+|          | req.User ==       |             |                                |
+|          |       c.User      |             |                                |
+|          | (Ensure same user)|             |                                |
+|          |                   |             |                                |
+|          | c.cInfo.pid is    |             |                                |
+|          | inactive          |             |                                |
+|          | (Verify Stale pid)|             |                                |
+|          |                   |   ACTIVE    |                                |
+|          |                   |             |  c.cInfo.pid = req.CInfo.Pid   |
+|          |                   |             |                                |
+|          |                   |             |  rsp.Token = c.Token           |
+|          |                   |             |  rsp.Status = ResumedSession   |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Exit    |                   |             |                                |
+|          | req.Token ==      |             |                                |
+|          |       c.Token     |             |                                |
+|          | (Ensure same sess)|             |                                |
+|          |                   |             |                                |
+|          | req.User ==       |             |                                |
+|          |       c.User      |             |                                |
+|          | (Ensure same user)|             |                                |
+|          |                   |             |                                |
+|          | req.CInfo.Pid ==  |             |                                |
+|          |      c.cInfo.pid  |             |                                |
+|          | (Verify same pid) |             |                                |
+|          |                   |  INACTIVE   |                                |
+|          |                   |             | c.CInfo.pid = 0                |
+|          |                   |             |                                |
+|          |                   |             | rsp.Status = ExitedSession     |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Abort   |                   |             |                                |
+|          | req.Token ==      |             |                                |
+|          |       c.Token     |             |                                |
+|          | (Ensure same sess)|             |                                |
+|          |                   |             |                                |
+|          | req.User ==       |             |                                |
+|          |       c.User      |             |                                |
+|          | (Ensure same user)|             |                                |
+|          |                   |             |                                |
+|          | req.CInfo.Pid ==  |             |                                |
+|          |      c.cInfo.pid  |             |                                |
+|          | (Verify same pid) |             |                                |
+|          |                   |    None     |                                |
+|          |                   |             | rsp.Status = AbortedSession    |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Commit  |                   |             |                                |
+|          | req.Token ==      |             |                                |
+|          |       c.Token     |             |                                |
+|          | (Ensure same sess)|             |                                |
+|          |                   |             |                                |
+|          | req.User ==       |             |                                |
+|          |       c.User      |             |                                |
+|          | (Ensure same user)|             |                                |
+|          |                   |             |                                |
+|          | req.CInfo.Pid ==  |             |                                |
+|          |      c.cInfo.pid  |             |                                |
+|          | (Verify same pid) |             |                                |
+|          |                   |             |                                |
+|          |                   |    None     |                                |
+|          |                   |             | c.ccDB.CommitTx()              |
+|          |                   |             |   recordCommitTx()             |
+|          |                   |             | c.ccDB.DeleteDB()              |
+|          |                   |             |                                |
+|          |                   |             |rsp.Status = CommittedSession   |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|   Kill   |                   |    None     |                                |
+|          |                   |             | c.ccDB.AbortTx()               |
+|          |                   |             | c.ccDB.DeleteDB()              |
+|          |                   |             |                                |
+|          |                   |             | rsp.Status = KilledSession     |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+
+
+#### cs_STATE_INACTIVE
+
+In the *INACTIVE* state, transitions can be made to *ACTIVE*, or *None* states.
+
+Table: cs_STATE_INACTIVE
+
+|   RPC    |     Conditions    |    State    |       Entry Action             |
+|:---------|:-----------------:|:------------|:------------------------------:|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Start   |                   |             |                                |
+|          | req.User ==       |             |                                |
+|          |       c.User      |             |                                |
+|          | (Ensure same user)|             |                                |
+|          |                   |   ACTIVE    |                                |
+|          |                   |             |  c.cInfo.pid = req.CInfo.Pid   |
+|          |                   |             |                                |
+|          |                   |             |  rsp.Token = c.Token           |
+|          |                   |             |  rsp.Status = ResumedSession   |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|   Exit   |                   |   INACTIVE  | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Abort   |                   |   INACTIVE  | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|  Commit  |                   |   INACTIVE  | rsp.Status = Error             |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+|          |                   |             |                                |
+|          |                   |             |                                |
+|   Kill   |                   |    None     |                                |
+|          |                   |             | c.ccDB.AbortTx()               |
+|          |                   |             | c.ccDB.DeleteDB()              |
+|          |                   |             |                                |
+|          |                   |             | rsp.Status = KilledSession     |
+|          |                   |             |                                |
+|          |                   |             |                                |
+|----------|-------------------|-------------|--------------------------------|
+
 
 ##### 3.2.2.7 Transformer
 
@@ -1506,28 +1792,39 @@ At Transformer init, it loads YANG modules pertaining to the applications. Trans
 Below structure is defined for the transformer spec:
 
 ```YANG
-type yangXpathInfo  struct {
-    yangDataType   string
-    tableName      *string
-    xfmrTbl        *string
-    childTable      []string
-    dbEntry        *yang.Entry
-    yangEntry      *yang.Entry
-    keyXpath       map[int]*[]string
-    delim          string
-    fieldName      string
-    xfmrFunc       string
-    xfmrField      string
-    xfmrPost       string
-    validateFunc   string
-    rpcFunc        string
-    xfmrKey        string
-    keyName        *string
-    dbIndex        db.DBNum
-    keyLevel       int
-    isKey          bool
-    defVal         string
-    hasChildSubTree bool
+type yangXpathInfo struct {
+	tableName          *string
+	xfmrTbl            *string
+	childTable         []string
+	yangEntry          *yang.Entry
+	keyXpath           map[int]*[]string
+	delim              string
+	fieldName          string
+	xfmrFunc           string
+	xfmrField          string
+	validateFunc       string
+	xfmrKey            string
+	keyName            *string
+	dbIndex            db.DBNum
+	keyLevel           uint8
+	isKey              bool
+	defVal             string
+	tblOwner           *bool
+	hasChildSubTree    bool
+	hasNonTerminalNode bool
+	subscribeMinIntvl  int
+	cascadeDel         int8
+	virtualTbl         *bool
+	nameWithMod        *string
+	operationalQP      bool
+	hasChildOpertnlNd  bool
+	yangType           yangElementType
+	xfmrPath           string
+	compositeFields    []string
+	dbKeyCompCnt       int
+	subscriptionFlags  utils.Bits
+	isDataSrcDynamic   *bool
+	isRefByKey         bool
 }
 ```
 
@@ -1552,6 +1849,8 @@ CRUD requests (configuration) are processed via the following steps:
 9. Invoke any annotated post-Transformer functions
 10. Transformer aggregates the results to returns to App module
 11. App module proceeds to update DB to ensure DB update in the order learnt from step 2
+
+    Refer [model based REPLACE & DELETE in Transformer](Management_Framework_Transformer_Component_Support_For_Model_based_Replace_And_Delete.md) for more details on REPLACE/PUT & DELETE processing.
 
 GET requests are processed via the following steps:
 1. App module asks the transformer to translate the URL to the keyspec to the query target
@@ -1587,18 +1886,14 @@ The translation hints are defined as YANG extensions to support simple table/fie
 
 ----------
 
-1. `sonic-ext:table-name [string]`: 
+1. `sonic-ext:table-name [string]`:
 Map a YANG container/list to TABLE name, processed by the default transformer method. Argument is a table name statically mapped to the given YANG container or list node.
 The table-name is inherited to all descendant nodes unless another one is defined.
 
-2. `sonic-ext:field-name [string]`: 
+2. `sonic-ext:field-name [string]`:
 Map a YANG leafy - leaf or leaf-list - node to FIELD name, processed by the default transformer method
 
-3. `sonic-ext:key-delimiter [string]`: 
-Override the default key delimiters used in Redis DB, processed by the default transformer method.
-Default delimiters are used by Transformer unless the extension is defined - CONFIG_DB: "&#124;", APPL_DB: "&#58;", ASIC_DB: "&#124;", COUNTERS_DB: "&#58;", FLEX_COUNTER_DB: "&#124;", STATE_DB: "&#124;"
-
-4. `sonic-ext:key-name [string]`: 
+3. `sonic-ext:key-name [string]`:
 Fixed key name, used for YANG container mapped to TABLE with a fixed key, processed by the default transformer method. Used to define a fixed key, mainly for container mapped to TABLE key
 e.g. Redis can have a hash “STP|GLOBAL”
 ```YANG
@@ -1606,37 +1901,43 @@ container global
    sonic-ext:table-name “STP”
    sonic-ext:key-name “GLOBAL”
 ```
-5. `sonic-ext:key-transformer [function]`: 
+4. `sonic-ext:key-transformer [function]`:
 Overloading default method with a callback to generate DB keys(s), used when the key values in a YANG list are different from ones in DB TABLE.
 A pair of callbacks should be implemented to support 2 way translation - **YangToDB***function*, **DbToYang***function*
 
-6. `sonic-ext:field-transformer [function]`: 
+5. `sonic-ext:field-transformer [function]`:
 Overloading default method with a callback to generate FIELD value, used when the leaf/leaf-list values defined in a YANG list are different from the field values in DB.
 A pair of callbacks should be implemented to support 2 way translation - **YangToDB***function*, **DbToYang***function*
 
-7. `sonic-ext:subtree-transformer [function]`: 
+6. `sonic-ext:subtree-transformer [function]`:
 Overloading default method with a callback for the current subtree, allows the sub-tree transformer to take full control of translation. Note that, if any other extensions, e.g. table-name etc., are annotated to the nodes on the subtree, they are not effective.
 The subtree-transformer is inherited to all descendant nodes unless another one is defined, i.e. the scope of subtree-transformer callback is limited to the current and descendant nodes along the YANG path until a new subtree transformer is annotated.
 A pair of callbacks should be implemented to support 2 way translation - **YangToDB***function*, **DbToYang***function*
 
-8. `sonic-ext:db-name [string]`: 
+7. `sonic-ext:db-name [string]`:
 DB name to access data – “APPL_DB”, “ASIC_DB”, “COUNTERS_DB”, “CONFIG_DB”, “FLEX_COUNTER_DB”, “STATE_DB”. The default db-name is CONFIG_DB, Used for GET operation to non CONFIG_DB, applicable only to SONiC YANG. Processed by Transformer core to traverse database.
 The db-name is inherited to all descendant nodes unless another one. Must be defined with the table-name
 
-9. `sonic-ext:post-transformer [function]`: 
+8. `sonic-ext:post-transformer [function]`:
 A special hook to update the DB requests right before passing to common-app, analogous to the postponed YangToDB subtree callback that is invoked at the very end by the Transformer.
 Used to add/update additional data to the maps returned from Transformer before passing to common-app, e.g. add a default acl rule 
 Note that the post-transformer can be annotated only to the top-level container(s) within each module, and called once for the given node during translation
 
-10. `sonic-ext:table-transformer [function]`: 
+9. `sonic-ext:table-transformer [function]`:
 Dynamically map a YANG container/list to TABLE name(s), allows the table-transformer to map a YANG list/container to table names.
 Used to dynamically map a YANG list/container to table names based on URI and payload.
 The table-transformer is inherited to all descendant nodes unless another one is defined
 
-11. `sonic-ext:get-validate [function]`: 
-A special hook to validate YANG nodes, to populate data read from database, allows developers to instruct Transformer to choose a YANG node among multiple nodes, while constructing the response payload. 
-Typically used to check the “when” condition to validate YANG node among multiple nodes to choose only valid nodes from sibling nodes.
+10. `sonic-ext:validate-xfmr [function]`:
+A special hook to validate if a YANG node hierarchy should be traversed when traversal is being done to service a SET/GET request from a specific parent YANG node.Typically used to check the “when” condition to validate YANG node among multiple nodes to choose only valid nodes from sibling nodes in agien yang hierarchy.
 
+11. `sonic-ext:table-owner:false [boolean]`:
+This annotation is useful in cases where DB table has data not only from the mapped yang node in the request, but also from host or another yang and a REPLACE/DELETE operation should not act on the whole instance/table-entry but just a subset of attributes/fields.
+Refer [model based REPLACE & DELETE in Transformer](Management_Framework_Transformer_Component_Support_For_Model_based_Replace_And_Delete.md) for more details and dynamic version of annotation.
+
+12. `sonic-ext:virtual-table:true [boolean]`:
+This annotation is useful where there is no matching table in the DB schema for a yang node, however that node needs to be traversed to reach the child yang hierarchy where DB mappings exist.
+Refer [model based REPLACE & DELETE in Transformer](Management_Framework_Transformer_Component_Support_For_Model_based_Replace_And_Delete.md) for more details and dynamic version of annotation.
 ----------
 
 
@@ -1670,19 +1971,28 @@ The function prototypes for external transformer callbacks are defined in the fo
 
 ```go
 type XfmrParams struct {
-        d *db.DB
-        dbs [db.MaxDB]*db.DB
-        curDb db.DBNum
-        ygRoot *ygot.GoStruct
-        uri string
-        requestUri string //original uri using which a curl/NBI request is made
-        oper int
-        key string
-        dbDataMap *map[db.DBNum]map[string]map[string]db.Value
-        subOpDataMap map[int]*RedisDbMap // used to add an in-flight data with a sub-op
-        param interface{}
-        txCache *sync.Map
-        skipOrdTblChk *bool
+	d                    *db.DB
+	dbs                  [db.MaxDB]*db.DB
+	curDb                db.DBNum
+	ygRoot               *ygot.GoStruct
+	xpath                string // flattened yang xpath of uri with uri predicates stripped off
+	uri                  string
+	requestUri           string //original uri using which a curl/NBI request is made
+	oper                 Operation
+	table                string
+	key                  string
+	dbDataMap            *map[db.DBNum]map[string]map[string]db.Value
+	subOpDataMap         map[Operation]*RedisDbMap // used to add an in-flight data with a sub-op
+	param                interface{}
+	txCache              *sync.Map
+	skipOrdTblChk        *bool
+	isVirtualTbl         *bool
+	yangDefValMap        map[string]map[string]db.Value
+	queryParams          QueryParams
+	pruneDone            *bool
+	invokeCRUSubtreeOnce *bool
+	ctxt                 context.Context
+    isNotTblOwner        *bool
 }
 
 /**
@@ -1742,12 +2052,11 @@ type ValidateCallpoint func (inParams XfmrParams) (bool)
  **/
 type RpcCallpoint func (body []byte, dbs [db.MaxDB]*db.DB) ([]byte, error)
 /**
- * PostXfmrFunc type is defined to use for handling any default handling operations required as part of the CREATE
- * Transformer function definition.
- * Param: XfmrParams structure having database pointers, current db, operation, DB data in multidimensional map, YgotRoot, uri
- * Return: multi dimensional map to hold the DB data, error
+ * PostXfmrFunc type is defined to use for handling cases where application want to override the final translation generated at the end of CRUD operation
+ * Param: XfmrParams structure having database pointers, current db, operation, DB data in multidimensional map resulting from the CRUD operation, YgotRoot, uri
+ * Return: error
  **/
-type PostXfmrFunc func (inParams XfmrParams) (map[string]map[string]db.Value, error)
+type PostXfmrFunc func (inParams XfmrParams) error
 /**
  * TableXfmrFunc type is defined to use for table transformer function for dynamic derviation of redis table.
  * Param: XfmrParams structure having database pointers, current db, operation, DB data in multidimensional map, YgotRoot, uri

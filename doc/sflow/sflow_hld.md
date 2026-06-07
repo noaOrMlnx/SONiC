@@ -13,6 +13,8 @@ Rev | Rev	Date	| Author	| Change Description
 |v1.0 |09/13/2019  |Sudharsan | Updating sequence diagram for various CLIs
 |v1.1 |10/23/2019  |Padmanabhan Narayanan | Update SAI section to use SAI_HOSTIF_ATTR_GENETLINK_MCGRP_NAME instead of ID. Note on genetlink creation. Change admin_state values to up/down instead of enable/disable to be consistent with management framework's sonic-common.yang.
 |v1.2 |03/07/2021  | Garrick He | Add VRF support and fix interface admin-status output.
+|v1.3 |01/24/2023  | Rajkumar (Marvell) | Add Egress Sflow support.
+|v1.4 |08/26/2024  | Peter Phaal (InMon), Ravindranath C K (Marvell), Madhu Paluru (Aviz), Junying Yeh (Edgecore) | Dropped packet notification (Mirror-on-Drop) support.
 
 ## 2. Scope
 This document describes the high level design of sFlow in SONiC
@@ -23,18 +25,19 @@ Definitions/Abbreviation|Description
 ------------------------|-----------
 SAI| Switch Abstraction Interface
 NOS| Network Operating System
-OID| OBject Identifier
+OID| Object IDentifier
 
 ## 4. Overview
 
-sFlow (defined in https://sflow.org/sflow_version_5.txt) is a standard-based sampling technology the meets the key requirements of network traffic monitoring on switches and routers. sFlow uses two types of sampling:
+sFlow (defined in https://sflow.org/sflow_version_5.txt) is a standard-based sampling technology that meets the key requirements of network traffic monitoring on switches and routers. sFlow supports the following:
 
 * Statistical packet-based sampling of switched or routed packet flows to provide visibility into network usage and active routes
 * Time-based sampling of interface counters.
+* Mirror On Drop (MOD) or Dropped packet Notification- The sFlow Dropped Packet Notification Structures extension (defined in https://sflow.org/sflow_drops.txt) adds a third type of measurement, reporting the packet header, ingress port, and drop reason for each packet dropped by the network device. This includes packets dropped by both the NPU and the software network stack.
 
 The sFlow monitoring system consists of:
 
- * sFlow Agents that reside in network equipment which gather network traffic and port counters and combines the flow samples and interface counters into sFlow datagrams and forwards them to the sFlow collector at regular intervals over a UDP socket. The datagrams consist of information on, but not limited to, packet header, ingress and egress interfaces, sampling parameters, and interface counters. A single sFlow datagram may contain samples from many flows.
+ * sFlow Agents that reside in network equipment which gather network traffic and port counters and combines the flow samples, interface counters, and dropped packet notifications into sFlow datagrams and forwards them to the sFlow collector at regular intervals over a UDP socket. The datagrams consist of information on, but not limited to, packet header, ingress and egress interfaces, sampling parameters, and interface counters. A single sFlow datagram may contain samples from many flows.
  * sFlow collectors which receive and analyze the sFlow data.
 
  sFlow is an industry standard, low cost and scalable technique that enables a single analyzer to provide a network wide view.
@@ -68,9 +71,8 @@ sFlow will be implemented in multiple phases:
 2. sFlow extended router support.
 
 ### Not planned to be supported:
-1. Egress sampling support.
-2. sFlow backoff mechanism (Drop the packets beyond configured CPU Queue rate limit).
-3. sFlow over vlan interfaces.
+1. sFlow backoff mechanism (Drop the packets beyond configured CPU Queue rate limit).
+2. sFlow over vlan interfaces.
 
 ## 6. Module Design
 
@@ -85,15 +87,32 @@ The newly introduced sflow container consists of:
 * An instantiation of the InMon's hsflowd daemon (https://github.com/sflow/host-sflow described in https://sflow.net/documentation.php). The hsflowd is launched as a systemctl service. The host-sflow is customised to interact with SONiC subsystems by introducing a host-sflow/src/Linux/mod_sonic.c (described later)
 * sflowmgrd : updates APP DB sFlow tables based on config updates
 
-The swss container is enhanced to add the following component:
-* sfloworch : which subscribes to the APP DB and acts as southbound interface to SAI for programming the SAI_SAMPLEPACKET sessions.
-* copporch : Copporch gets the genetlink family name and multicast group from copp.json file, programs the SAI genetlink attributes and associates it with trap group present for sflow in copp.json
+#### SWSS
+The swss container is enhanced to add the sfloworch component and update copporch:
+1. **sfloworch** : Subscribes to the APP DB and acts as southbound interface to SAI for programming the following:
 
-The syncd container is enhanced to support the SAI SAMPLEPACKET APIs.
+    a. *Sample Packet* sessions:
+      - SAI_SAMPLEPACKET APIs
 
+    b. *Mirror On Drop*:
+    
+      - SAI_TAM APIs
+      - SAI Hostif APIs
+          * Hostif of type SAI_HOSTIF_TYPE_GENETLINK and associate with GENETLINK family "NET_DM" and mcgroup "events".
+          * UDT of type SAI_HOSTIF_USER_DEFINED_TRAP_TYPE_TAM and associate it with a dedicated trap group and configure the rate-limit.
+          * Hostif Table entry to map packets trapped by the above UDT to the "NET_DM" hostif object created earlier.
+
+
+2. **copporch** : Copporch gets the genetlink family name and multicast group from copp.json file, programs the SAI genetlink attributes and associates it with trap group present for sflow in copp.json.
+
+
+#### Syncd
+The syncd container is enhanced to support the SAI SAMPLEPACKET and SAI TAM APIs.
+
+#### ASIC Driver
 The ASIC drivers need to be enhanced to:
-* Associate the SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET to a specific genetlink channel and multicast group.
-* Punt trapped samples to this genetlink group
+* _To support sampling packets_: Associate the SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET to genetlink channel _'psample'_ and multicast group _'packets'_. The sampled packets from the ASIC should be posted on this genetlink by the ASIC driver.
+* _To support Mirror On Drop_: Enable TAM packet drop event and  associate the packets with genetlink family _'NET_DM'_ and multicast group _'events'_. The ASIC must send the dropped packets to the ASIC driver which in turn posts it on this genetlink group.
 
 The sflow container and changes to the existing components to support sflow are described in the following sections.
 
@@ -103,12 +122,144 @@ The following figure shows the configuration and control flows for sFlow:
 ![alt text](../../images/sflow/sflow_config_and_control.png "SONiC sFlow Configuration and Control")
 
 1. The user configures the sflow collector, agent, sampling related parameters (interfaces to be sampled and rate) and these configurations are added to the CONFIG DB.
-2. The copporch (based on swssconfig/sample/00-copp.config.json) calls a SAI API that enables the ASIC driver to map the SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET trap to the specific genetlink channel and multicast group. The SAI driver creates the genetlink family and multicast group which will eventually be used to punt sFlow samples to hsflowd. If the SAI implementation uses the psample kernel driver (https://github.com/torvalds/linux/blob/master/net/psample/psample.c), the genetlink family "psample" and multicast group "packets" that the psample driver creates is to be used.
+2. a) __sFlow packet sample configuration__: The copporch (based on swssconfig/sample/00-copp.config.json) calls a SAI API that enables the ASIC driver to map the SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET trap to the specific genetlink channel and multicast group. The SAI driver creates the genetlink family and multicast group which will eventually be used to punt sFlow samples to hsflowd. If the SAI implementation uses the psample kernel driver (https://github.com/torvalds/linux/blob/master/net/psample/psample.c), the genetlink family "psample" and multicast group "packets" that the psample driver creates is to be used.
+2. b) __sFlow mirror on drop configuration__: Packets can either be dropped in the hardware or by the Linux Kernel Network stack.
+The Linux module dropmon provides a standard mechanism for user space applications to get notified about the packets being dropped in the kernel. The dropmon module registers the genetlink family _'NET_DM'_ and multicast group _'events'_ to which the dropped packet notifications are sent. In order to keep a consistent interface, the ASIC driver needs to use the same family and multicast group to send the notifications for packets dropped by the hardware.
+Further, sFlowOrch creates a SAI TAM object based on TAM Packet drop event and attaches it to the switch.
+These SAI configurations are done by sFlowOrch. SAI Platform capability checks are used to ensure that these SAI configurations are done only on platforms with ASIC support. The ASIC support is identified using the SAI attribute capability query. The SAI details are fully explained later in the SAI section.
 3. The sflowmgrd daemon watches the CONFIG DB's SFLOW_COLLECTOR table and updates the /etc/hsflowd.conf which is the configuration file for hsflowd. Based on the nature of changes, the sflowmgrd may restart the hsflowd service. The hsflowd service uses the collector, UDP port and agent IP information to open sockets to reach the sFlow collectors.
-4. When hsflowd starts, the sonic module (mod_sonic) registered callback for packetBus/HSPEVENT_CONFIG_CHANGED opens a netlink socket for packet reception and registers an sflow sample handler over the netlink socket (HsflowdRx()).
+4. When hsflowd starts, the sonic module (mod_sonic) registered callback for packetBus/HSPEVENT_CONFIG_CHANGED opens a netlink socket for packet reception and registers an sflow sample handler over the netlink socket (HsflowdRx()). Note: Separate Genetlink sockets are opened for sFlow sample packet and MOD packets.
 5. Sampling rate changes are updated in the SFLOW table. The sflowmgrd updates sampling rate changes into SFLOW_TABLE in the App DB. The sfloworch subagent in the orchagent container processes the change to propagate as corresponding SAI SAMPLEPACKET APIs.
 
-Below figures explain the flow for different commands from CLI to SAI
+#### **Design Options**
+Current CLI command takes "sample-rate" as input.
+```
+"SFLOW_SESSION": {
+        "Ethernet0": {
+           "admin_state": "down"
+           "sample_rate": "40000"
+        },
+}
+```
+With introduction of egress sflow, we need to change above schema to take ingress and egress sampling rate from user.
+
+**Option 1 - Direction part of Key**
+
+    "SFLOW_SESSION": {
+        "Ethernet0|rx": {
+           "admin_state": "down"
+           "sample_rate": "40000"
+        },
+        "Ethernet0|tx": {
+           "admin_state": "down"
+           "sample_rate": "40000"
+        },
+        "Ethernet16|rx": {
+           "admin_state": "up"
+           "sample_rate": "32768"
+        }
+    }
+
+If user issues a "config sflow interface disable all", the SFLOW_SESSION will have the following:
+
+```
+    "SFLOW_SESSION": {
+        "all|rx":{
+            "admin_state":"down"
+        },
+        ...
+     }
+```
+If user issues a "config sflow interface disable all direction both", the SFLOW_SESSION will have the following:
+```
+    "SFLOW_SESSION": {
+        "all|rx":{
+            "admin_state":"down"
+        },
+        "all|tx":{
+            "admin_state":"down"
+        },
+        ...
+     }
+```
+Pros:
+1) User can manage admin_status per tx/rx.
+
+
+Cons:
+1) Not align to openconfig model.
+2) New sub-level cli command inside interface hierarchy. Get admin-status and sample-rate at interface and direction level.
+
+Example:
+```
+localhost(config)# interface Ethernet 0
+localhost(conf-if-Ethernet0)# sflow direction rx
+localhost(conf-if-Ethernet0-sflow-rx)# enable
+localhost(conf-if-Ethernet0-sflow-rx)# sampling-rate 10000
+```
+
+**Option 2: Introduce ingress/egress sample rate**
+```
+"SFLOW_SESSION": {
+        "Ethernet0": {
+           "admin_state": "down"
+           "ingress_sample_rate": "40000"
+           "egress_sample_rate": "50000"
+        }
+}
+```
+**NOTES:**
+
+- Single admin-state controls both rx and tx together.
+- In order for the administrator to disable sflow on a direction, administrator must set corresponding sampling-rate to 0.
+- If sample-rate is not set, sflowmgrd will set default sample-rate based on port speed.
+
+**Behavior on unsupported platforms:**
+- For platforms not supporting egress Sflow, add SAI capability query and save this capability in STATE_DB.
+- CLIs will validate this capability check. For example, if user configures egress sampling-rate on un-supported ASIC, cli will throw error.
+- sflowMgrd will query the capability and set egress-sampling rate to 0 in APP_DB.
+
+Pros:
+1) Align to openconfig model.
+
+**Option 3 - Introduce sample_direction at global and interface level**
+```
+"SFLOW": {
+        "global": {
+           "admin_state": "up"
+           "polling_interval": "20"
+           "agent_id": "loopback0",
+           "sample_direction": "rx"
+         }
+    }
+
+"SFLOW_SESSION": {
+        "Ethernet0": {
+           "admin_state": "down"
+           "sample_rate": "40000"
+           "sample_direction": "both"
+        }
+}
+
+```
+**NOTES:**
+
+- sample_direction command determines the sampling direction.
+- admin-state and sample-rate will be applicable only for the configured sample_direction.
+- sample_direction at interface-level has higher precedence then global configuration.
+- If sample_direction is not set, default is rx for backward compatibility.
+
+**Behavior on unsupported platforms:**
+- In init, query SAI egress sample capability and save this capability in STATE_DB.
+- CLIs will validate this capability check. For example, if user configures sample_direction as "tx" or "both" on un-supported ASIC, cli will throw error.
+- Similarly sflowOrch will also check the capability and set ASIC_DB only when supported.
+
+**Preferred Option 3**: Based on community feedback, this option is selected.
+
+Below figures explain the flow for different commands from CLI to SAI.
+
+In sflowOrch, APIs sflowAddPort()/sflowDelPort will take "direction" as additional argument. Based on egress sampling query-capability support, egress sample will be enabled on interface.
+
 
 ![alt text](../../images/sflow/sflow_enable.png "SONiC sFlow Enable command")
 
@@ -120,8 +271,68 @@ Below figures explain the flow for different commands from CLI to SAI
 
 ![alt text](../../images/sflow/sflow_intf_rate.png "SONiC Interface rate set command")
 
+#### MOD Config flow
 
-### 6.3 **sFlow sample path**
+
+```mermaid
+sequenceDiagram
+
+participant admin
+participant CLI
+participant hsflowd
+participant kernel
+participant CONFIG_DB
+participant SflowMgr
+participant APP_DB
+participant STATE_DB
+participant SwitchOrch
+participant SflowOrch
+participant SAI
+
+SwitchOrch ->> SAI : Get SAI capability
+activate SwitchOrch
+SwitchOrch ->> STATE_DB: Set MOD capability
+deactivate SwitchOrch
+admin ->> CLI :  sflow drop-monitor-limit {value}
+activate CLI
+CLI ->> STATE_DB : Verify MOD is supported
+CLI ->> CONFIG_DB : SFLOW| 'drop_monitor_limit' : <value>
+deactivate CLI
+CONFIG_DB ->> hsflowd : Enable/disable drop monitor
+activate hsflowd
+hsflowd ->> kernel : Open/Close Genetlink for NET_DM events
+deactivate hsflowd
+CONFIG_DB ->> SflowMgr : SFLOW| 'drop_monitor_limit' : <value>
+activate SflowMgr
+SflowMgr ->> STATE_DB : Verify MOD is supported
+SflowMgr ->> APP_DB : SFLOW| drop_monitor_limit: <value>
+deactivate SflowMgr
+APP_DB ->> SflowOrch : SFLOW| drop_monitor_limit: <value>
+activate SflowOrch
+SflowOrch ->> SAI : SAI TAM and Hostif APIs
+deactivate SflowOrch
+```
+
+#### Identify MOD capability
+
+All of the below conditions should be met to list a platform as MOD capable.
+
+##### Enum Capability Queries
+||Attribute || Desired Enum in the returned capability list  ||
+|SAI_TAM_EVENT_ATTR_TYPE | SAI_TAM_EVENT_TYPE_PACKET_DROP|
+|SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TYPE | SAI_HOSTIF_USER_DEFINED_TRAP_TYPE_TAM|
+
+##### vAttribute Capability query
+
+||Attribute||
+|SAI_SWITCH_ATTR_TAM_OBJECT_ID|
+|SAI_TAM_COLLECTOR_ATTR_HOSTIF_TRAP|
+|SAI_TAM_ATTR_EVENT_OBJECTS_LIST|
+|SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TRAP_GROUP|
+
+
+
+### 6.3a **sFlow sample path**
 The following figure shows the sFlow sample packet path flow:
 
 ![alt text](../../images/sflow/sflow_sample_packet_flow.png "SONiC sFlow sample packet flow")
@@ -132,11 +343,90 @@ The following figure shows the sFlow sample packet path flow:
 4. The hsflowd daemon's HsflowdRx() is waiting on the specific genetlink family name's multicast group id and receives the encapsulated sample. The HsflowdRx parses and extracts the encapsulated sflow attributes and injects the sample to the hsflowd packet thread using takeSample().
 5. The hsflowd packet thread accumulates sufficient samples and then constructs an sFlow UDP datagram and forwards to the configured sFlow collectors.
 
+### 6.3b **Mirror On Drop (MOD) notification path**
+The following figure shows the MOD notification path flow:
+```mermaid
+sequenceDiagram
+
+
+  box Kernel drops
+  participant kernel
+  end
+
+  box h/w drops
+  participant ASIC
+  participant Driver
+  end
+
+  participant GENETLINK
+
+  box sFlow Container 
+  participant hsflowd
+  end
+
+participant sFlow_Collector
+
+par kernel to GENETLINK
+
+
+kernel ->> GENETLINK : Drop with discard reason to NET_DM
+
+and ASIC to GENETLINK
+
+ASIC ->> Driver : 'Drop Event' (dropped pkt along with drop metadata)
+Driver ->> GENETLINK :  'Drop Notification' multicast genetlink message to NET_DM group 'events'
+
+end
+
+GENETLINK ->> hsflowd : message to group 'events'
+
+hsflowd ->> sFlow_Collector : sampleType DISCARD
+
+```
+1. **Packets dropped by the ASIC to genetlink**
+      - The ASIC sends MOD notification to the ASIC driver.
+      - The ASIC driver encapsulates the sample in a genetlink buffer and adds the following netlink attributes to the sample: 
+      
+        - NET_DM_ATTR_IN_PORT (NET_DM_ATTR_PORT_NETDEV_IFINDEX and NET_DM_ATTR_PORT_NETDEV_NAME),
+        - NET_DM_ATTR_ORIGIN (as NET_DM_ORIGIN_HW)
+        - NET_DM_ATTR_HW_TRAP_NAME,   
+        - NET_DM_ATTR_HW_TRAP_GROUP_NAME,
+        - NET_DM_ATTR_TIMESTAMP 
+        - NET_DM_ATTR_PAYLOAD, 
+        - NET_DM_ATTR_ORIG_LEN, 
+        - NET_DM_ATTR_TRUNC_LEN, 
+        The use of the above genetlink attributes allows the ASIC driver to convert device specific metadata present in the notification received from the NPU in to standard genetlink attributes. This abstracts hsflowd from device specific behavior. 
+      - The ASIC driver sends the filled genetlink buffer using `genlmsg_multicast()` to family `NET_DM` on multicast group _'events'_.
+
+2. **Packets dropped by the Kernel to genetlink**
+      - The kernel _`drop_monitor`_ module encapsulates the dropped packet in a genetlink buffer and adds the following netlink attributes to the sample:
+        - NET_DM_ATTR_IN_PORT, 
+        -  NET_DM_ATTR_ORIGIN (as NET_DM_ORIGIN_SW),
+        - NET_DM_ATTR_PC, 
+        - NET_DM_ATTR_REASON, 
+        - NET_DM_ATTR_SYMBOL, 
+        - NET_DM_ATTR_TIMESTAMP, 
+        - NET_DM_ATTR_PAYLOAD 
+        - NET_DM_ATTR_ORIG_LEN, 
+        - NET_DM_ATTR_PROTO, 
+      - The module sends the filled genetlink buffer via `genlmsg_multicast()` to family `NET_DM` on multicast group _'events'_. 
+      
+      Note: The genetlink attribute  _NET_DM_ATTR_ORIGIN_'s value _NET_DM_ORIGIN_SW/HW_ can be used by hsflowd to distinguish between software and hardware drops respectively.
+
+3. **Genetlink to hsflowd daemon**
+    - The `HsflowdRx()` is waiting on the specific genetlink family name's multicast group id named _'events'_ and receives the encapsulated sample. The `HsflowdRx` parses and extracts the encapsulated sflow attributes and injects the sample to the hsflowd packet thread using `takeSample()`.
+
+4. **The hsflowd to Collector**
+    - The hsflowd packet thread accumulates sufficient samples and then constructs an sFlow UDP datagram and forwards it to the configured sFlow collectors.
+
+Note: The Kernel must have the drop_monitor module enabled. This module registers the Genetlink family `'NET_DM'`.
+
 ### 6.4 **sFlow counters**
 
 The sFlow counter polling interval is set to 20 seconds. The pollBus/HSPEVENT_UPDATE_NIO callback caches the interface SAI OIDs during the first call by querying COUNTER_DB:COUNTERS_PORT_NAME_MAP. It periodically retrieves the COUNTER_DB interface counters and fills the necessary counters in hsflowd's SFLHost_nio_counters.
 
 ### 6.5 **CLI**
+
 
 #### sFlow utility interface
 * sflow [options] {config | show} ...
@@ -175,12 +465,24 @@ The sFlow counter polling interval is set to 20 seconds. The pollBus/HSPEVENT_UP
   Globally, sFlow is disabled by default. When sFlow is enabled globally, the sflow deamon is started and sampling will start on all interfaces which have sFlow enabled at the interface level (see “config sflow interface…”).
 When sflow is disabled globally, sampling is stopped on all relevant interfaces and sflow daemon is stopped.
 
+* **sflow sample-direction <rx|tx|both>**
+
+  This command takes global sflow sample direction. If not configured, default is "rx" for backward compatibility. Based on the direction, the sFlow is enabled at all the interface level at rx or tx or both.
+
 * **sflow interface <enable|disable>** *<{interface-name}|**all**>*
 
   Enable/disable sflow at an interface level. By default, sflow is enabled on all interfaces at the interface level.  Use this command to explicitly disable sFlow for a specific interface. An interface is sampled if sflow is enabled globally as well as at the interface level.
 
   The “all” keyword is used as a convenience to enable/disable sflow at the interface level for all the interfaces.
-  
+
+  Note: The local configuration applied to an interface has higher precedence over the global configuration provided through the "all" keyword. If sample-direction is not set at interface level, it will configure direction "rx" irrespective of global configuraion. User needs to override the same with "config sflow interface sample-direction" command.
+
+  This command enables sampling only in rx direction for backward compatibility.
+
+* **sflow interface sample-direction <rx|tx|both>** *<{interface-name}|**all**>*
+
+  Set sample direction to determine ingress sampling or egress sampling or both. If not configured, default is "rx".
+
   Note: The local configuration applied to an interface has higher precedence over the global configuration provided through the "all" keyword.
 
 * **sflow interface sample-rate** *{interface-name} {value}*
@@ -200,6 +502,11 @@ When sflow is disabled globally, sampling is stopped on all relevant interfaces 
 
   * value is the average number of packets skipped before the sample is taken. As per SAI samplepacket definition : "The sampling rate specifies random sampling probability as the ratio of packets observed to samples generated. For example a sampling rate of 256 specifies that, on average, 1 sample will be generated for every 256 packets observed."
   * Valid range 256:8388608.
+
+  Note that on an interface, the sample-rate must be same in both tx and rx direction.
+
+  If sample-direction is not set at interface level, it will configure direction "rx" irrespective of global configuraion. User needs to override the same with "config sflow interface sample-direction" command.
+
 
 * **sflow polling-interval** *{value}*
 
@@ -221,6 +528,13 @@ When sflow is disabled globally, sampling is stopped on all relevant interfaces 
   * If port speed changes, this setting will be used to determine the updated sample-rate for the interface.
   * The config sflow interface sample-rate {interface-name} {value} setting can still be used to override the speed based setting for specific interfaces.
 
+* **sflow drop-monitor-limit** *{value}*
+
+  Enable and rate limit dropped packet notifications.
+
+  * Valid range 0-500 notifications per second
+  * Set drop-monitor-limit to 0 to disable
+
 
 #### Show commands
 
@@ -239,7 +553,11 @@ When sflow is disabled globally, sampling is stopped on all relevant interfaces 
 
 &#35; sflow enable
 
+&#35; sflow sample-direction both
+
 &#35; sflow interface disable Ethernet0
+
+&#35; sflow interface sample-direction Ethernet0 tx
 
 &#35; sflow interface sample-rate Ethernet16 32768
 
@@ -250,45 +568,33 @@ The configDB objects for the above CLI is given below:
     "SFLOW_COLLECTOR": {
         "collector1": {
             "collector_ip": "10.100.12.13",
-            "collector_port": "6343"
-			"collector_vrf": "default"
+            "collector_port": "6343",
+            "collector_vrf": "default"
         },
         "collector2": {
             "collector_ip": "10.144.1.2",
-            "collector_port": "6344"
-			"collector_vrf": "mgmt"
+            "collector_port": "6344",
+            "collector_vrf": "mgmt"
         }
     },
 
     "SFLOW": {
         "global": {
-           "admin_state": "up"
-           "polling_interval": "20"
+           "admin_state": "up",
+           "polling_interval": "20",
            "agent_id": "loopback0",
-         }
-    }
-
+           "sample_direction": "both",
+           "drop_monitor_limit": "0"
+         },
+    },
     "SFLOW_SESSION": {
         "Ethernet0": {
-           "admin_state": "down"
-           "sample_rate": "40000"
+           "admin_state": "down",
+           "sample_rate": "40000",
+           "sample_direction": "tx"
         },
-        "Ethernet16": {
-           "admin_state": "up"
-           "sample_rate": "32768"
-        }
     }
-
-```
-
-If user issues a "config sflow interface disable all", the SFLOW_SESSION will have the following:
-```
-    "SFLOW_SESSION": {
-        "all":{
-            "admin_state":"down"
-        },
-        ...
-     }
+}
 ```
 
 &#35; show sflow
@@ -296,55 +602,31 @@ If user issues a "config sflow interface disable all", the SFLOW_SESSION will ha
 Displays the current configuration, global defaults as well as user configured values including collectors.
 
 ```
-sFlow services are enabled
-Counter polling interval: 20
-2 collectors configured:
-Collector IP addr: 10.100.12.13, UDP port: 6343
-Collector IP addr: 10.144.1.2, UDP port: 6344
-Agent ID: loopback0 (10.0.0.10)
+sFlow Global Information:
+  sFlow Admin State:          up
+  sFlow Sample Direction:     both
+  sFlow Polling Interval:     0
+  sFlow Drop Notification Limit: 0
+  sFlow AgentID:              default
+
+  2 Collectors configured:
+    Name: prod                IP addr: fe80::6e82:6aff:fe1e:cd8e UDP port: 6343   VRF: mgmt
+    Name: ser5                IP addr: 172.21.35.15    UDP port: 6343   VRF: default
 
 ```
 
 &#35; show sflow interface
 
 Displays the current running configuration of sflow interfaces.
-
 ```
-Interface     Admin Status   Sampling rate
----------     ------------   -------------
-Ethernet0     down           40000
-Ethernet1     up             40000
-Ethernet2     up             40000
-Ethernet3     up             40000
-Ethernet4     up             40000
-Ethernet5     up             40000
-Ethernet6     up             40000
-Ethernet7     up             40000
-Ethernet8     up             40000
-Ethernet9     up             40000
-Ethernet10    up             40000
-Ethernet11    up             40000
-Ethernet12    up             40000
-Ethernet13    up             40000
-Ethernet14    up             40000
-Ethernet15    up             40000
-Ethernet16    up             32768
-Ethernet17    up             40000
-Ethernet18    up             40000
-Ethernet19    up             40000
-Ethernet20    up             40000
-Ethernet21    up             40000
-Ethernet22    up             40000
-Ethernet23    up             40000
-Ethernet24    up             40000
-Ethernet25    up             40000
-Ethernet26    up             40000
-Ethernet27    up             40000
-Ethernet28    up             40000
-Ethernet29    up             40000
-Ethernet30    up             40000
-Ethernet31    up             40000
-
+Interface     Admin Status   Sampling rate     Sampling direction
+---------     ------------   -------------     -------------------
+Ethernet0     down           40000             rx
+Ethernet1     up             25000             tx
+Ethernet2     up             40000             both
+Ethernet3     up             40000             both
+Ethernet4     up             40000             rx
+Ethernet5     up             40000             rx
 ```
 
 ### 6.6 **DB and Schema changes**
@@ -376,6 +658,8 @@ key                 = SFLOW
 ADMIN_STATE         = "up" / "down"
 POLLING_INTERVAL    = 1*3DIGIT      ; counter polling interval
 AGENT_ID            = ifname        ; Interface name
+SAMPLE_DIRECTION    = "rx"/"tx"/"both" ; Sampling direction
+DROP_MONITOR_LIMIT  = 1*3DIGIT      ; rate limit for packet drop notifications. A value of 0 indicates that MOD is disabled.
 ```
 
 A new SFLOW_SESSION table would be added.
@@ -383,6 +667,8 @@ A new SFLOW_SESSION table would be added.
 key SFLOW_SESSION:interface_name
 ADMIN_STATE     = "up" / "down"
 SAMPLE_RATE     = 1*7DIGIT      ; average number of packets skipped before the sample is taken
+SAMPLE_DIRECTION    = "rx"/"tx"/"both" ; Sampling direction
+
 ```
 
 #### AppDB & Schema
@@ -390,10 +676,11 @@ SAMPLE_RATE     = 1*7DIGIT      ; average number of packets skipped before the s
 A new SFLOW_SESSION_TABLE is added to the AppDB:
 
 ```
-; Defines schema for SFLOW_SESSION_TABLE which holds global configurations
+; Defines schema for SFLOW_SESSION_TABLE which holds Sflow configurations per interface
 key 			= SFLOW_SESSION_TABLE:interface_name
 ADMIN_STATE	    = "up" / "down"
 SAMPLE_RATE     = 1*7DIGIT      ; average number of packets skipped before the sample is taken
+SAMPLE_DIRECTION    = "rx"/"tx"/"both" ; Sampling direction
 ```
 
 A new SFLOW_SAMPLE_RATE_TABLE table which maps interface speed to the sample rate for that speed is added to the AppDB
@@ -403,6 +690,95 @@ key                 = SFLOW_SAMPLE_RATE_TABLE:speed
 SAMPLE_RATE         = 1*7DIGIT      ; average number of packets skipped before the sample is taken
 ```
 Where speed         = 1*6DIGIT      ; port line speed in Mbps
+
+A new SFLOW_TABLE is introduced for global configuration like drop monitor
+
+```
+; Defines schema for SFLOW table which holds global configurations
+key                 = SFLOW
+DROP_MONITOR_LIMIT  = 1*3DIGIT      ; rate limit for packet drop notifications. A value of 0 indicates that MOD is disabled.
+```
+
+
+
+#### StateDB Schema
+Add "PORT_EGRESS_SAMPLE_CAPABLE" under switch capability for egress sFlow support.
+Add "MIRROR_ON_DROP_CAPABLE" under switch capability for MOD support.
+
+```
+"SWITCH_CAPABILITY|switch": {
+    "value": {
+      "PORT_EGRESS_SAMPLE_CAPABLE": "true"
+      "MIRROR_ON_DROP_CAPABLE": "true"
+    }
+  }
+```
+#### **DB Migration**
+Since there is a change in schema for SFLOW and SFLOW_SESSION in config DB and SFLOW_SESSION_TABLE in APP DB, we will add support to migrate the entries to new schema in db_migrator.py. Default behavior would be append the existing entries with "sample_direction" with value "rx".
+
+
+Existing ConfigDB schema
+```
+"SFLOW": {
+        "global": {
+           "admin_state": "up",
+           "polling_interval": "20",
+           "agent_id": "loopback0"
+         }
+    }
+"SFLOW_SESSION": {
+        "Ethernet0": {
+           "admin_state": "down",
+           "sample_rate": "40000"
+        },
+}
+```
+After migration
+```
+"SFLOW": {
+        "global": {
+           "admin_state": "up",
+           "polling_interval": "20",
+           "agent_id": "loopback0",
+           "sample_direction": "rx"
+         }
+    }
+"SFLOW_SESSION": {
+        "Ethernet0": {
+           "admin_state": "down",
+           "sample_rate": "40000",
+           "sample_direction": "rx"
+        }
+}
+```
+**APP DB Migration**
+
+First-time when user migrates from non-supported to supported version.
+
+Before upgrade:
+```
+  "SFLOW_TABLE:global": {
+      "admin_state": "up"
+  },
+ "SFLOW_SESSION_TABLE:Ethernet6": {
+      "admin_state": "up",
+      "sample_rate": "1000"
+  }
+
+```
+Post upgrade:
+```
+"SFLOW_TABLE:global": {
+      "admin_state": "up",
+      "sample_direction": "rx"
+  },
+ "SFLOW_SESSION_TABLE:Ethernet6": {
+      "admin_state": "up",
+      "sample_rate": "1000",
+      "sample_direction": "rx"
+  }
+
+```
 
 ### 6.7 **sflow container**
 
@@ -425,6 +801,7 @@ collecttor vrf| collector.vrf
 agent ip-address | agentIP
 max-datagram-size | datagramBytes
 sample-rate | sampling
+drop-monitor-limit | dropmon.limit
 
 The master list of supported host-sflow tokens are found in host-sflow/src/Linux/hsflowtokens.h
 
@@ -444,20 +821,29 @@ hsflowd bus/events|SONiC callback actions
 
 Refer to host-sflow/src/Linux/hsflowd.h for a list of events.
 
+#### mod_dropmon
+
+Configuring a non-zero sflow drop-monitor-limit enables the hsflowd mod_dropmon module which uses the generic netlink drop_monitor interface to register for and receive packet drop notifications for software and hardware drops https://github.com/torvalds/linux/blob/master/include/uapi/linux/net_dropmon.h which are then exported as sFlow Dropped Packet Notification Structures https://sflow.org/sflow_drops.txt
+
+The netlink drop_monitor interface is used by the Linux kernel NET_DM module to report on packets dropped within the software stack. Integrating software and hardware dropped packet monitoring simplifies the task of the driver since trapped packets that need to be delivered to the network stack, for example ttl expired packets delivered to the Linux stack where the packet will be dropped and an ICMP TTL expired message will be generated, don't need to copied and reported as a hardware drop since the software drop will be reported by the kernel.
+
 ### 6.8 **SWSS and syncd changes**
 
 ### sFlowOrch
 
 An sFlowOrch is introduced in the Orchagent to handle configuration requests. The sFlowOrch essentially facilitates the creation/deletion of samplepacket sessions as well as get/set of session specific attributes. sFlowOrch sets the genetlink host interface that is to be used by the SAI driver to deliver the samples.
 
-Also, it monitors the SFLOW_SESSIONS_TABLE and PORT state to determine sampling rate / speed changes to derive and set the sampling rate for all the interfaces. It uses the SAI samplepacket APIs to set each ports's sampling rate.
+Also, it monitors the SFLOW_SESSIONS_TABLE and PORT state to determine sampling rate / speed changes to derive and set the sampling rate for all the interfaces. Ingress/Egress Sampling is enabled on the interfaces based on direction setting. It uses the SAI samplepacket APIs to set each ports's sampling rate.
+
+Finally, sFlowOrch facilitates the creation/deletion of dropped packet sessions as well as get/set of session specific attributes. This includes calling the TAM APIs to set up monitoring of the packet drop events in the hardware. sFlowOrch also sets the genetlink host interface that is to be used by the SAI driver to deliver dropped packet notifications and reason codes.
 
 ### Rate limiting
 
 Considering that sFlow backoff mechanism is not being implemented, users should consider rate limiting sFlow samples using the currently existing COPP mechanism (the COPP config (e.g. src/sonic-swss/swssconfig/sample/00-copp.config.json) can include appropriate settings for the samplepacket trap and initialised using swssconfig).
 
-### 6.9 **SAI changes**
+Similarly, dropped packet notifications should be rate limited using existing COPP mechanism.
 
+### 6.9 **SAI changes**
 Creating sFlow sessions and setting attributes (e.g. sampling rate) is described in SAI proposal : https://github.com/opencomputeproject/SAI/tree/master/doc/Samplepacket
 
 As per the sFlow specification, each packet sample should have certain minimal meta data for processing by the sFlow analyser. The psample infrastructure (http://man7.org/linux/man-pages/man8/tc-sample.8.html) already describes the desired metadata fields (which the SAI driver needs to add to each sample):
@@ -490,7 +876,9 @@ SAMPLED PACKETS METADATA FIELDS
               The rate the packet was sampled with
 ```
 
-The SAI driver may provide the interface OIDs corresponding to the IIFINDEX AND OIFINDEX. The hsflowd mod_sonic HsflowdRx() may have to map these correspondingly to the netdev ifindex. Note that the default PSAMPLE_ATTR_SAMPLE_GROUP that hsflowd expects is 1.
+The SAI driver may provide the interface OIDs corresponding to the IIFINDEX AND OIFINDEX. The hsflowd mod_sonic HsflowdRx() may have to map these correspondingly to the netdev ifindex. Note that the default PSAMPLE_ATTR_SAMPLE_GROUP that hsflowd expects is 1 for ingress and 2 for egress.
+
+Depending on platform capabilities, SAI driver may report additional attributes defined in https://github.com/torvalds/linux/blob/master/include/uapi/linux/psample.h. For example, PSAMPLE_ATTR_OUT_TC (egress queue), PSAMPLE_ATTR_OUT_TC_OCC (egress queue depth), and PSAMPLE_ATTR_LATENCY (transit delay) populate the sFlow Transit Delay Structures (https://sflow.org/sflow_transit.txt).
 
 Rather than define a new framework for describing the metadata for sFlow use, SAI would re-use the framework that the psample driver (https://github.com/torvalds/linux/blob/master/net/psample/psample.c) currently uses. The psample kernel driver is based on the Generic Netlink subsystem that is described in https://wiki.linuxfoundation.org/networking/generic_netlink_howto. SAI ASIC drivers supporting sFlow may choose to use the psample.ko driver as-is or may choose to implement the generic netlink interface (that complies with the above listed metadata) using a private generic netlink family.
 
@@ -591,23 +979,192 @@ sai_create_hostif_table_entry_fn(&host_table_entry, 4, sai_host_table_attr);
 
 It is assumed that the trap group and the trap itself have been defined using sai_create_hostif_trap_group_fn() and sai_create_hostif_trap_fn().
 
-## 7 **Warmboot support**
+### 6.10 Mapping dropped packet traps to a GENETLINK host interface multicast group
+
+Below is an example code snip that shows how a GENETLINK based host inerface is created.
+
+```
+sai_object_id_t hostif_id;
+sai_attribute_t hostif_attr[3];
+
+hostif_attr[0].id = SAI_HOSTIF_ATTR_TYPE;
+hostif_attr[0].value = SAI_HOSTIF_TYPE_GENETLINK;
+
+hostif_attr[1].id = SAI_HOSTIF_ATTR_NAME;
+hostif_attr[1].value = "NET_DM";
+
+sai_host_if_attr[2].id = SAI_HOSTIF_ATTR_GENETLINK_MCGRP_NAME;
+sai_host_if_attr[2].value = "events";
+
+aai_create_hostif_fn(&hostif_id, 3, hostif_attr);
+```
+
+Below is the code snip that outlines how a dropped packet notifications are mapped to the GENETLINK host interface.
+
+```
+sai_object_id_t table_entry;
+sai_attribute_t table_attr[4];
+
+table_attr[0].id = SAI_HOSTIF_TABLE_ENTRY_ATTR_TYPE;
+table_attr[0].value = SAI_HOSTIF_TABLE_ENTRY_TYPE_TRAP_ID;
+
+table_attr[1].id = SAI_HOSTIF_TABLE_ENTRY_ATTR_TRAP_ID;
+table_attr[1].value = discard_packet_trap_id; // Object referencing DISCARD packet traps
+
+table_attr[2].id = SAI_HOSTIF_TABLE_ENTRY_ATTR_CHANNEL;
+table_attr[2].value = SAI_HOSTIF_TABLE_ENTRY_CHANNEL_TYPE_GENETLINK;
+
+table_attr[3].id = SAI_HOSTIF_TABLE_ENTRY_ATTR_HOST_IF;
+table_attr[3].value = hostif_id;
+
+sai_create_hostif_table_entry_fn(&table_entry, 4, table_attr);
+```
+It is assumed that the trap group and the trap itself have been defined using sai_create_hostif_trap_group_fn() and sai_create_hostif_trap_fn().
+
+Please refer to the  [SAI Proposal TAM MOD Localhost - API Example](https://github.com/opencomputeproject/SAI/blob/master/doc/TAM/SAI-Proposal-TAM-MOD-Localhost.md#50--api-example) for the detailed SAI API sequence.
+
+Similar to sampled packet notifications, dropped packet notifications are mapped to the following NET_DM attributes https://github.com/torvalds/linux/blob/master/include/uapi/linux/net_dropmon.h
+
+```
+NET_DM_ATTR_IN_PORT
+       The input interface index of the packet, if there is one,
+       identified by NET_DM_ATTR_PORT_NETDEV_IFINDEX.
+
+NET_DM_ATTR_ORIG_LEN
+       The size of the original packet (before truncation)
+
+NET_DM_ATTR_TRUNC_LEN
+       Number of packet header bytes in message
+
+NET_DM_ATTR_PAYLOAD
+       Packet header bytes
+
+NET_DM_ATTR_HW_TRAP_GROUP_NAME
+       String describing drop group, e.g. "l2_drops"
+
+NET_DM_ATTR_HW_TRAP_NAME
+       String describing specific drop reason, e.g. "ingress_vlan_filter"
+```
+
+#### Drop Reasons
+Published group and trap names in [devlink trap documentation](https://www.kernel.org/doc/html/latest/networking/devlink/devlink-trap.html) should be used where ever possible. The hsflowd agent maps well known group and trap names to standard sFlow drop reasons ([sFlow drop reasons](https://sflow.org/sflow_drops_reasons.txt)). The normalized sFlow drop reason, along with the raw group and trap strings from the netlink message, are included in the sFlow drop notification. In the case where a vendor specific drop reason does not map into the published list, a well known group name should be used, and a unique vendor specific trap name should be used (prefixing the trap name with a vendor identifier is recommended as a means to ensure uniqueness). In this case, hsflowd will map the trap name to an unknown value: unknown, unknown_l2, unknown_l3, etc. based on the group name. The standard sFlow drop reasons abstract architecture specific drop reasons into generalized categories, for example, ingress and egress ACL drops are reported using the generalized acl drop reason. If the vendor specific drop reason maps to an existing sFlow drop reason, then the mapping should be added to the hsflowd source code ([host-sflow](https://github.com/sflow/host-sflow)). If  additional sFlow drop reasons are required, contact sFlow.org to get them added to the standard list.
+
+#### SAI capability query for Sflow
+```
+ sai_attr_capability_t capability;
+// Ingress Sflow capability query
+status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_PORT, SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE, &capability);
+
+// Egress Sflow capability query
+status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_PORT, SAI_PORT_ATTR_EGRESS_SAMPLEPACKET_ENABLE, &capability);
+```
+#### Mapping of Sflow to interface
+```
+// Ingress Sflow mapped to "ingress-sample" rate.
+attr.id = SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE;
+attr.value.oid = sample_id;
+set_port_attribute(port_id, &attr);
+
+// Egress Sflow mapped to direction "egress-sample" rate.
+attr.id = SAI_PORT_ATTR_EGRESS_SAMPLEPACKET_ENABLE;
+attr.value.oid = sample_id;
+set_port_attribute(port_id, &attr);
+
+```
+## 7 **CLI Yang Model**
+```
+diff --git a/src/sonic-yang-models/yang-models/sonic-sflow.yang b/src/sonic-yang-models/yang-models/sonic-sflow.yang
+index 62984f064..601d112fd 100644
+--- a/src/sonic-yang-models/yang-models/sonic-sflow.yang
++++ b/src/sonic-yang-models/yang-models/sonic-sflow.yang
+@@ -28,10 +28,28 @@ module sonic-sflow{
+
+     description "SFLOW yang Module for SONiC OS";
+
++    revision 2023-03-14 {
++        description "Add direction command to support egress sflow";
++    }
++
+     revision 2021-04-26 {
+         description "First Revision";
+     }
+
++    typedef sample_direction {
++        type enumeration {
++            enum rx {
++                description "rx direction";
++            }
++            enum tx {
++                description "tx direction";
++            }
++            enum both {
++                description "Both tx and rx direction";
++            }
++        }
++    }
++
+     container sonic-sflow {
+
+         container SFLOW_COLLECTOR {
+@@ -89,6 +107,13 @@ module sonic-sflow{
+                     }
+                     description "Sets the packet sampling rate.  The rate is expressed as an integer N, where the intended sampling rate is 1/N packets.";
+                 }
++
++                leaf sample_direction {
++                    type sample_direction;
++                    default "rx";
++                    description "sflow sample direction"
++                }
++
+             } /* end of list SFLOW_SESSION_LIST */
+         } /* end of container SFLOW_SESSION */
+
+@@ -133,6 +158,13 @@ module sonic-sflow{
+                     }
+                     description "Interface name";
+                 }
++
++                leaf sample_direction {
++                    type sample_direction;
++                    default "rx";
++                    description "sflow sample direction"
++                }
++
+
++                leaf drop_monitor_limit {
++                    type uint16 {
++                        range "0|1..500" {
++                            error-message "sFlow packet drop monitor limit must be 0 or in range 1-500"
++                        }
++                    }
++                    description
++                        "Configures the maximum number of packet drops to monitor for sFlow. 
++                         A value of 0 disables drop monitoring. Valid values are 1 to 500.";
++                }
+
+             } /* end of container global */
+        } /* end of container SFLOW */
+
+```
+## 8 **Warmboot support**
 
 sFlow packet/counter sampling should not be affected after a warm reboot. In case of a planned warm reboot, packet sampling will be stopped.
 
-## 8 **sFlow in Virtual Switch**
+## 9 **sFlow in Virtual Switch**
 
 On the SONiC VS, SAI calls would map to the tc_sample commands on the switchport interfaces (http://man7.org/linux/man-pages/man8/tc-sample.8.html).
 
-## 9 **Build**
+## 10 **Build**
 
 * The host-sflow package will be built with the mod_sonic callback implementations using the FEATURES="SONIC" option
 
-## 10 **Restrictions**
+## 11 **Restrictions**
 * /etc/hsflowd.conf should not be modified manually. While it should be possible to change /etc/hsflowd.conf manually and restart the sflow container, it is not recommended.
 * configuration updates will necessitate hsflowd service restart
+* hsflowd daemon will initialize only after receiving the SYSTEM_READY|SYSTEM_STATE Status=Up from SONiC. The system ready state however depends on all the monitored daemons to be ready. Failure on any of these, will result in system state to be down. In such scenarios, sflow will wait until 180 seconds and if system ready is not up will proceed with initialization. For system ready feature please visit https://github.com/sonic-net/SONiC/blob/master/doc/system_health_monitoring/system-ready-HLD.md
 
-## 11 **Unit Test cases**
+## 12 **Unit Test cases**
 Unit test case one-liners are given below:
 
 | S.No | Test case synopsis                                                                                                                      |
@@ -617,10 +1174,10 @@ Unit test case one-liners are given below:
 |  3   | Verify that sFlowOrch creates "psample" multicast group "packets" if there is not psample driver inserted.                              |
 |  4   | Verify that sFlowOrch maps SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET trap to the "psample" family and multicast group "packets".                |
 |  5   | Verify that it is possible to enable and disable sflow using the SFLOW table's admin_state field in CONFIG_DB                           |
-|  6   | Verify that interfaces can be enabled/disabled using additions/deletions in SFLOW_SESSION table in CONFIG_DB                            |
+|  6   | Verify that interfaces can be enabled/disabled using additions/deletions in SFLOW_SESSION table.                           |
 |  7   | Verify that it is possible to change the counter polling interval using the SFLOW table in CONFIG_DB                                    |
 |  8   | Verify that it is possible to change the agent-id using the SFLOW table in CONFIG_DB
-|  9   | Verify that it is possible to change the sampling rate per interface using SFLOW_SESSION interface sample_rate field in CONFIG_DB       |
+|  9   | Verify that it is possible to change the sampling rate per interface using SFLOW_SESSION interface sample_rate field for direction tx, rx and both in CONFIG_DB       |
 | 10   | Verify that changes to SFLOW_SESSION CONFIG_DB entry is pushed to the corresponding table in APP_DB and to ASIC_DB by sFlowOrch         |
 | 11   | Verify that collector and per-interface changes get reflected using the "show sflow" and "show sflow interface" commands                |
 | 12   | Verify that packet samples are coming into hsflowd agent as per the global and per-interface configuration                              |
@@ -630,7 +1187,7 @@ Unit test case one-liners are given below:
 | 16   | Verify that sample collection works on all ports or on a subset of ports (using lowest possible sampling rate).                         |
 | 17   | Verify that counter samples are updated every 20 seconds                                                                                |
 | 18   | Verify that packet & counter samples stop for a disabled interface.                                                                     |
-| 19   | Verify that sampling changes based on interface speed and per-interface sampling rate change.                                           |
+| 19   | Verify that sampling changes based on interface speed and per-interface and direction sampling rate change. Validate for sample-direction rx,txand both. |
 | 20   | Verify that if sFlow is not enabled in the build, the sflow docker is not started                                                       |
 | 21   | Verify that sFlow docker can be stopped and restarted and check that packet and counter sampling restarts.                              |
 | 22   | Verify that with config saved in the config_db.json, restarting the unit should result in sFlow coming up with saved configuration.     |
@@ -639,7 +1196,18 @@ Unit test case one-liners are given below:
 | 25   | Verify that the swss restart works without issues when sflow is enabled and continues to sample as configured. |
 | 26   | Verify that collector functions properly on 'default' VRF and can send counter and flow samples |
 | 27   | Verify that collector functions properly on 'mgmt' VRF and can send counter and flow samples |
+| 28   | Verify that egress sampling is applied based on query-capability. |
+|29   | Verify CONFIG DB migration changes for SFLOW SESSION table for old to new schema
+|30    | Verify APP DB migration changes for SFLOW SESSION table for old to new schema
 
-## 12 **Action items**
+## 13 **System Testcase**
+New ptf test cases will be added for this feature.
+
+## 14 **Action items**
 * Determine if it is possible to change configuration without restarting hsflowd
 * Check host-sflow licensing options
+* Change hsflowd to version 2.0.45-1 for accepting egress samples.
+
+## 15 **Acknowledgements**
+
+We would like to thank eBay (a special mention to Aldrin) for driving the MoD support in SONiC across the partners InMon, Marvell, Edgecore and Aviz.
