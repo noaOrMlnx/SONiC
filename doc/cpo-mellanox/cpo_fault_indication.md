@@ -1,6 +1,6 @@
 ---
 name: CPO Fault Indication
-overview: Add CPO (Co-Packaged Optics) fault detection in Mellanox PMON. A dedicated Mellanox-only thread, lazily spawned from Chassis.get_change_event on the first interrupt, delegates the COR-safe EEPROM read to dom_mgr via two APPL_DB Redis pub/sub channels (REFRESH_COUNTERS_ON_DEMAND for request, REFRESH_COUNTERS_ON_DEMAND_DONE for completion) using NotificationProducer/Consumer, then reads the existing TRANSCEIVER_DOM_FLAG / TRANSCEIVER_STATUS_FLAG tables, maps each asserted flag field to an xcvr_cpo_* token, logs a WARNING to syslog, and writes the tokens into a new dedicated xcvr_fault field on the existing STATE_DB TRANSCEIVER_STATUS_SW row. gNMI subscribers observe the change through the existing STATE_DB telemetry path; subscribers who want to watch only fault events may need to add a new subscription to the xcvr_fault field.
+overview: Add CPO (Co-Packaged Optics) fault detection in Mellanox PMON. A dedicated Mellanox-only thread, lazily spawned from Chassis.get_change_event on the first interrupt, delegates the COR-safe EEPROM read to dom_mgr via two APPL_DB Redis pub/sub channels (REFRESH_COUNTERS_ON_DEMAND for request, REFRESH_COUNTERS_ON_DEMAND_DONE for completion) using NotificationProducer/Consumer, then reads the existing TRANSCEIVER_DOM_FLAG / TRANSCEIVER_STATUS_FLAG / TRANSCEIVER_ELS_DOM_FLAG / TRANSCEIVER_ELS_STATUS_FLAG tables, maps each asserted flag field to an xcvr_cpo_* token, logs a WARNING to syslog, and writes the tokens into a new dedicated xcvr_fault field on the existing STATE_DB TRANSCEIVER_STATUS_SW row. gNMI subscribers observe the change through the existing STATE_DB telemetry path; subscribers who want to watch only fault events may need to add a new subscription to the xcvr_fault field.
 isProject: false
 ---
 
@@ -12,6 +12,7 @@ isProject: false
 | --- | ---------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 0.1 | May 2026   | Noa Or | Initial draft.                                                                                                                                                                                                                        |
 | 0.2 | Jul 2026   | Noa Or | Delegate COR-safe EEPROM reads to `dom_mgr` via two new APPL_DB pub/sub channels (`REFRESH_COUNTERS_ON_DEMAND` request, `REFRESH_COUNTERS_ON_DEMAND_DONE` completion).|
+| 0.3 | Jul 2026   | Noa Or | Align design to community dom_mgr design changes. |
 
 ## 2. Scope
 
@@ -21,7 +22,7 @@ In scope:
 
 - Listening for fault interrupts on the per-vModule sysfs node `/sys/module/sx_core/asic0/module{sdk_index}/interrupt` for every CPO vModule.
 - Delegating the COR-safe EEPROM read of the CPO fault pages to `dom_mgr` (xcvrd's DOM manager) via two new APPL_DB Redis pub/sub channels: `REFRESH_COUNTERS_ON_DEMAND` (request) and `REFRESH_COUNTERS_ON_DEMAND_DONE` (completion), both using `swss::NotificationProducer` / `swss::NotificationConsumer`.
-- Consuming the existing STATE_DB flag tables `TRANSCEIVER_DOM_FLAG` and `TRANSCEIVER_STATUS_FLAG` that dom_mgr already populates.
+- Consuming the STATE_DB flag tables `TRANSCEIVER_DOM_FLAG`, `TRANSCEIVER_STATUS_FLAG`, `TRANSCEIVER_ELS_DOM_FLAG`, and `TRANSCEIVER_ELS_STATUS_FLAG` that dom_mgr populates (the exact per-field schema of the two ELS tables is provided in a follow-up revision — this design references them by name and by which fault categories land in them).
 - Mapping each asserted flag field to a canonical `xcvr_cpo_*` token via an in-code name-to-token dictionary.
 - Logging the parsed fault information to syslog with WARNING severity.
 - Writing the tokens into a new dedicated field `xcvr_fault` on the existing STATE_DB `TRANSCEIVER_STATUS_SW|<port>` row. This feature is the sole writer of `xcvr_fault`; xcvrd's existing fields (`status`, `cmis_state`, `error`) are untouched. gNMI subscribers receive the change through the existing STATE_DB telemetry path; subscribers who want to watch only fault events may need to add a new subscription to the `xcvr_fault` field.
@@ -66,16 +67,16 @@ Spectrum CPO hardware exposes a single fault interrupt per vModule, surfaced as 
 
 The same `module{sdk_index}` directory already hosts the plug-event sysfs files (`present`, `hw_present`, `power_good`) that Mellanox `Chassis.get_change_event()` polls today.
 
-The CPO fault information itself lives in three EEPROM pages: **0x0** (module-level + lower-memory thermal flags), **0x11** (per-lane flags), and **0x1A** (ELS flags). Most of the bits in those pages are **Clear-On-Read (COR)** — reading them returns their latched value and simultaneously resets them to zero. If two independent readers touch the same COR bytes they lose events. In today's SONiC, the periodic reader of those bytes is `dom_mgr`, which polls every 60 s and publishes the parsed flag values into `TRANSCEIVER_DOM_FLAG` and `TRANSCEIVER_STATUS_FLAG`.
+The CPO fault information itself lives in three EEPROM pages: **0x0** (module-level + lower-memory thermal flags), **0x11** (per-lane flags), and **0x1A** (ELS flags). Most of the bits in those pages are **Clear-On-Read (COR)** — reading them returns their latched value and simultaneously resets them to zero. If two independent readers touch the same COR bytes they lose events. In today's SONiC, the periodic reader of those bytes is `dom_mgr`, which polls every 60 s and publishes the parsed flag values into `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` (module-level) and `TRANSCEIVER_ELS_DOM_FLAG` / `TRANSCEIVER_ELS_STATUS_FLAG` (ELS-specific).
 
 **Key design choice:** this feature does NOT read the CPO CoR fault pages directly. Instead it asks `dom_mgr` to do an on-demand read, then consumes the tables that `dom_mgr` publishes. That keeps `dom_mgr` as the sole COR reader and completely avoids the two-readers-racing-on-COR problem.
 
 The flow is:
 
 1. Mellanox `Chassis.get_change_event()` polls the interrupt sysfs alongside the plug-event fds. On the first assertion, it lazily spawns a Mellanox-only `FaultIndicationTask` thread and enqueues the affected vModule.
-2. The task resolves the vModule to its 1..N logical ports and sends one notification per port on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel via `NotificationProducer`, carrying the port name, the list of flag tables to refresh, and a correlation timestamp.
-3. `dom_mgr`'s `NotificationConsumer` on that channel wakes for each notification, performs its COR-safe read on the module, refreshes `TRANSCEIVER_DOM_FLAG` and `TRANSCEIVER_STATUS_FLAG` for those ports, and sends a corresponding notification on `REFRESH_COUNTERS_ON_DEMAND_DONE` with status + timestamps.
-4. The task, woken by the DONE notification, reads both flag tables for each port and scans every field. Each field whose value is `true`/`1` maps via `_FLAG_TO_TOKEN` to an `xcvr_cpo_*` token. Multiple simultaneous faults naturally produce multiple tokens.
+2. The task resolves the vModule to its 1..N logical ports and sends one notification per port on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel via `NotificationProducer`, carrying the port name, the list of flag tables to refresh, a `force` flag (always `false` in our use case — see 7.6.1), and a correlation timestamp.
+3. `dom_mgr`'s `NotificationConsumer` on that channel wakes for each notification, performs its COR-safe read on the module (subject to the `force` flag — see 7.6.1), refreshes `TRANSCEIVER_DOM_FLAG`, `TRANSCEIVER_STATUS_FLAG`, `TRANSCEIVER_ELS_DOM_FLAG`, and `TRANSCEIVER_ELS_STATUS_FLAG` for those ports, and sends a corresponding notification on `REFRESH_COUNTERS_ON_DEMAND_DONE` with status + timestamps.
+4. The task, woken by the DONE notification, reads all four flag tables for each port and scans every field. Each field whose value is `true`/`1` maps via `_FLAG_TO_TOKEN` to an `xcvr_cpo_*` token. Multiple simultaneous faults naturally produce multiple tokens.
 5. The task logs a WARNING to syslog and writes the tokens into a new dedicated `xcvr_fault` field on `TRANSCEIVER_STATUS_SW|<port>`. This feature is the **only writer** of `xcvr_fault`; xcvrd continues to own `status`, `cmis_state`, and `error` (never touched by us). No cross-writer coordination is needed.
 
 **Why Redis pub/sub, not tables**: requests are one-shot messages, not state. Pub/sub delivers them once and forgets, so there is nothing to clean up and nothing to replay after a restart. Same pattern as `WatermarkOrch`'s `WM_CLEAR_NOTIFICATIONS` channel.
@@ -89,10 +90,10 @@ Functional:
 3. `FaultIndicationTask` shall be spawned once, on the first interrupt. It is a long-lived worker for the rest of xcvrd's lifetime. Subsequent interrupts do not spawn additional threads.
 4. On every interrupt (first or subsequent), PMON shall enqueue the affected vModule to the running `FaultIndicationTask`'s work queue.
 5. `FaultIndicationTask` shall run as a `daemon=True` thread, so the Python runtime reaps it when xcvrd exits. No generic-xcvrd code change is required for shutdown. See section 7.3.1 for the safety analysis of abrupt teardown.
-6. For every dequeued vModule, `FaultIndicationTask` shall send one notification per **underlying physical port** on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel, using the **first split** (lowest-index breakout logical port) of each physical port as the message's `op` value. It shall **not** send an additional notification for the other breakout splits of the same physical port. Rationale: `dom_mgr` performs a single EEPROM read per physical port and writes the refreshed flags to the `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` rows of **all** logical ports mapped to that physical port; sending additional REFRESHes for the other splits would trigger redundant EEPROM reads with no new information. Example — vModule 0 covers physical ports {1, 9, 17, 25}, each broken out into two logical ports (Ethernet0/4, Ethernet8/12, Ethernet16/20, Ethernet24/28). This requirement produces exactly four notifications, addressed to Ethernet0, Ethernet8, Ethernet16, Ethernet24. Duplicate interrupts on the same vModule while a previous request is in flight are **not** coalesced — each interrupt produces its own set of four notifications.
+6. For every dequeued vModule, `FaultIndicationTask` shall send one notification per **underlying physical port** on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel, using the **first split** (lowest-index breakout logical port) of each physical port as the message's `op` value. Each notification shall carry `force=false` (see 7.6.1). It shall **not** send an additional notification for the other breakout splits of the same physical port. Rationale: `dom_mgr` performs a single EEPROM read per physical port and writes the refreshed flags to the `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` / `TRANSCEIVER_ELS_DOM_FLAG` / `TRANSCEIVER_ELS_STATUS_FLAG` rows of **all** logical ports mapped to that physical port; sending additional REFRESHes for the other splits would trigger redundant EEPROM reads with no new information. Example — vModule 0 covers physical ports {1, 9, 17, 25}, each broken out into two logical ports (Ethernet0/4, Ethernet8/12, Ethernet16/20, Ethernet24/28). This requirement produces exactly four notifications, addressed to Ethernet0, Ethernet8, Ethernet16, Ethernet24. Duplicate interrupts on the same vModule while a previous request is in flight are **not** coalesced — each interrupt produces its own set of four notifications.
 7. `FaultIndicationTask` shall wait up to **20 s** for the corresponding notification on `REFRESH_COUNTERS_ON_DEMAND_DONE`. On timeout it shall log a WARNING and skip that request (no retry).
-8. After the DONE indication, `FaultIndicationTask` shall read `TRANSCEIVER_DOM_FLAG|<port>` and `TRANSCEIVER_STATUS_FLAG|<port>`, iterate all fields, and emit one `xcvr_cpo_*` token per field whose value is `true` (or `1`), using the in-code `_FLAG_TO_TOKEN` mapping.
-9. `FaultIndicationTask` shall log the parsed fault info to syslog at WARNING severity **on every processed interrupt**, even when all parsed tokens are already present in `xcvr_fault`. Repeated log entries are the operator's signal that the underlying HW fault keeps re-asserting. It shall also write the tokens into the new dedicated `xcvr_fault` field of `TRANSCEIVER_STATUS_SW|<port>` for **every logical port of the vModule, including every breakout split** — not just the first splits used in R6's REFRESH fan-out. Since dom_mgr's on-demand poll refreshes the `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` rows for every logical port of the physical port, the same set of tokens is applicable to every split, and any operator watching any split's `xcvr_fault` must see the fault. Following the same example as R6, the write fan-out reaches **eight** rows (Ethernet0, Ethernet4, Ethernet8, Ethernet12, Ethernet16, Ethernet20, Ethernet24, Ethernet28), each getting the same tokens. This feature is the **sole writer** of `xcvr_fault`. It does not touch `status`, `cmis_state`, or `error`.
+8. After the DONE indication, `FaultIndicationTask` shall read `TRANSCEIVER_DOM_FLAG|<port>`, `TRANSCEIVER_STATUS_FLAG|<port>`, `TRANSCEIVER_ELS_DOM_FLAG|<port>`, and `TRANSCEIVER_ELS_STATUS_FLAG|<port>`, iterate all fields across the four tables, and emit one `xcvr_cpo_*` token per field whose value is `true` (or `1`), using the in-code `_FLAG_TO_TOKEN` mapping.
+9. `FaultIndicationTask` shall log the parsed fault info to syslog at WARNING severity **on every processed interrupt**, even when all parsed tokens are already present in `xcvr_fault`. Repeated log entries are the operator's signal that the underlying HW fault keeps re-asserting. It shall also write the tokens into the new dedicated `xcvr_fault` field of `TRANSCEIVER_STATUS_SW|<port>` for **every logical port of the vModule, including every breakout split** — not just the first splits used in R6's REFRESH fan-out. Since dom_mgr's on-demand poll refreshes all four flag tables for every logical port of the physical port, the same set of tokens is applicable to every split, and any operator watching any split's `xcvr_fault` must see the fault. Following the same example as R6, the write fan-out reaches **eight** rows (Ethernet0, Ethernet4, Ethernet8, Ethernet12, Ethernet16, Ethernet20, Ethernet24, Ethernet28), each getting the same tokens. This feature is the **sole writer** of `xcvr_fault`. It does not touch `status`, `cmis_state`, or `error`.
 10. `FaultIndicationTask` shall NOT remove previously-emitted `xcvr_cpo_*` tokens from `xcvr_fault` just because the underlying flag deasserted. Interrupt deassertion is not a HW recovery signal (per CPO doc 8.6); token clearing is an operator-driven action (Open Item 4). Implementation: read `xcvr_fault`, take the **set union** with the newly-computed tokens (each token appears **at most once** in the stored string), write back — a **read-modify-write (RMW)** pattern. Re-asserting a fault that is already in `xcvr_fault` therefore produces a no-op write; a token is never duplicated. This is safe because the feature is the only writer of the field.
 11. The feature shall be Mellanox-scoped and shall not affect non-Mellanox platforms or the legacy `get_change_event_legacy` path. On non-Mellanox platforms, the `xcvr_fault` field is simply absent from `TRANSCEIVER_STATUS_SW` rows.
 
@@ -126,11 +127,14 @@ Triggered when `FaultIndicationTask` dequeues a vModule. Ends when dom_mgr publi
 flowchart TD
   q["FaultIndicationTask work queue"]
   q --> resolve["resolve vmodule to logical ports"]
-  resolve --> req["Step 1: NotificationProducer.send<br/>on APPL_DB channel<br/>REFRESH_COUNTERS_ON_DEMAND, one per port"]
+  resolve --> req["Step 1: NotificationProducer.send<br/>on APPL_DB channel<br/>REFRESH_COUNTERS_ON_DEMAND, one per port<br/>(force=false)"]
   req --> sub["dom_mgr NotificationConsumer<br/>receives each notification"]
-  sub --> read["COR-safe EEPROM read<br/>on the affected module"]
-  read --> refresh["Refresh STATE_DB<br/>DOM_FLAG and STATUS_FLAG per port"]
-  refresh --> done["NotificationProducer.send<br/>on APPL_DB channel<br/>REFRESH_COUNTERS_ON_DEMAND_DONE"]
+  sub --> check{"force=true OR<br/>requested_timestamp &gt;<br/>last_update_time?"}
+  check -->|no, fresh enough| skip["skip EEPROM read<br/>tables already fresh"]
+  check -->|yes| read["COR-safe EEPROM read<br/>on the affected module"]
+  read --> refresh["Refresh STATE_DB<br/>DOM_FLAG / STATUS_FLAG /<br/>ELS_DOM_FLAG / ELS_STATUS_FLAG<br/>per port"]
+  refresh --> done["NotificationProducer.send<br/>on APPL_DB channel<br/>REFRESH_COUNTERS_ON_DEMAND_DONE<br/>(fvs.status=OK)"]
+  skip --> done
 ```
 
 ### 6.3 Fault handling flow — response phase
@@ -142,10 +146,8 @@ flowchart TD
   wait["Step 2: FaultIndicationTask waits<br/>on APPL_DB DONE channel<br/>via NotificationConsumer"]
   wait --> check{"DONE received<br/>within 20s?"}
   check -->|no, timeout| logto["log WARNING<br/>could not receive DONE on time<br/>skip this cycle"]
-  check -->|yes| parse["Step 3a: read DOM_FLAG and STATUS_FLAG<br/>scan fields, map to xcvr_cpo tokens"]
-  parse --> direct["Step 3b: direct EEPROM read<br/>pg1A bytes 212-219 (non-COR)<br/>map per-lane codes to xcvr_cpo tokens"]
-  direct --> write["Step 4: syslog WARNING<br/>write merged tokens to<br/>TRANSCEIVER_STATUS_SW.xcvr_fault"]
-  write --> cleanup["DEL DONE row"]
+  check -->|yes| parse["Step 3: read DOM_FLAG / STATUS_FLAG /<br/>ELS_DOM_FLAG / ELS_STATUS_FLAG<br/>scan fields, map to xcvr_cpo tokens"]
+  parse --> write["Step 4: syslog WARNING<br/>write tokens to<br/>TRANSCEIVER_STATUS_SW.xcvr_fault"]
   write -.->|existing STATE_DB telemetry| gnmi["gNMI subscriber"]
 ```
 
@@ -182,19 +184,20 @@ No changes to `sonic-swss`, `sonic-syncd`, `sonic-swss-common`, `sonic-platform-
 
 - **New file**: `sonic-buildimage/platform/mellanox/mlnx-platform-api/sonic_platform/fault_indication_task.py`
   - `class FaultIndicationTask(threading.Thread)`.
-  - Owns: a work queue (fed by `Chassis`), a `NotificationProducer` on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel, a `NotificationConsumer` on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND_DONE` channel, STATE_DB readers for the flag tables, and a `TRANSCEIVER_STATUS_SW` writer.
-  - Loop: pop from work queue → send request → wait for DONE (or 20 s timeout) → parse → syslog → write tokens to `xcvr_fault`.
+  - Owns: a work queue (fed by `Chassis`), a `NotificationProducer` on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND` channel, a `NotificationConsumer` on the APPL_DB `REFRESH_COUNTERS_ON_DEMAND_DONE` channel, STATE_DB readers for the four flag tables (`TRANSCEIVER_DOM_FLAG`, `TRANSCEIVER_STATUS_FLAG`, `TRANSCEIVER_ELS_DOM_FLAG`, `TRANSCEIVER_ELS_STATUS_FLAG`), and a `TRANSCEIVER_STATUS_SW` writer.
+  - Loop: pop from work queue → send request (with `force=false`) → wait for DONE (or 20 s timeout) → parse → syslog → write tokens to `xcvr_fault`.
   - Lifecycle: created lazily by `Chassis` on the first interrupt as a `daemon=True` thread. Reaped by the Python runtime when xcvrd exits. Exposes a `request_stop()` method used only by unit tests. See section 7.3.1.
 
 - **New file**: `sonic-buildimage/platform/mellanox/mlnx-platform-api/sonic_platform/xcvr_fault.py`
-  - Static `_FLAG_TO_TOKEN` dict: maps flag field name (as published by `dom_mgr` in `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG`) to the corresponding `xcvr_cpo_*` token name. Full listing in section 7.4.
-  - Helpers: `get_all_logical_ports_of_vmodule(cpo_port) -> List[str]`, `update_xcvr_fault_field(port, tokens)` (RMW union on the `xcvr_fault` field only), and the parse-and-tokenise loop.
+  - Static `_FLAG_TO_TOKEN` dict: maps flag field name (as published by `dom_mgr` in `TRANSCEIVER_DOM_FLAG`, `TRANSCEIVER_STATUS_FLAG`, `TRANSCEIVER_ELS_DOM_FLAG`, or `TRANSCEIVER_ELS_STATUS_FLAG`) to the corresponding `xcvr_cpo_*` token name. Full listing in section 7.4.1.
+  - Helpers: `get_all_logical_ports_of_vmodule(cpo_port) -> List[str]`, `update_xcvr_fault_field(port, tokens)` (RMW union on the `xcvr_fault` field only), and `parse_and_tokenize(port)` which iterates all four flag tables and applies `_FLAG_TO_TOKEN`.
   - Lazy `swsscommon.DBConnector` for STATE_DB (pattern from [pcie.py](sonic-buildimage/platform/mellanox/mlnx-platform-api/sonic_platform/pcie.py)) and `swsscommon.ConfigDBConnector` for CONFIG_DB (pattern from [utils.py](sonic-buildimage/platform/mellanox/mlnx-platform-api/sonic_platform/utils.py)).
 
 - [sonic-buildimage/src/sonic-platform-daemons/sonic-xcvrd/xcvrd/dom/dom_mgr.py](sonic-buildimage/src/sonic-platform-daemons/sonic-xcvrd/xcvrd/dom/dom_mgr.py)
   - New `NotificationConsumer` on APPL_DB channel `REFRESH_COUNTERS_ON_DEMAND`. Registered into the existing `swsscommon.Select` object that the main loop already polls (no new thread).
   - New `NotificationProducer` on APPL_DB channel `REFRESH_COUNTERS_ON_DEMAND_DONE`.
-  - On each incoming notification: parse `requested_tables`, do a COR-safe on-demand read for that logical port (reuses the existing per-port poll infrastructure that already handles link-change fast-path polls), refresh the requested STATE_DB tables, then send a DONE notification with `status`, `requested_timestamp` (copied from the request notification), and `completed_timestamp`.
+  - On each incoming notification: parse `requested_tables`, `force`, and `timestamp`. If `force=false` and the per-table `last_update_time` in the requested STATE_DB tables is newer than the request's `timestamp`, skip the EEPROM read (tables are already fresh). Otherwise do a COR-safe on-demand read for that logical port (reuses the existing per-port poll infrastructure that already handles link-change fast-path polls) and refresh the requested STATE_DB tables. In both branches, send a DONE notification with `fvs.status`, `fvs.requested_timestamp` (copied from the request notification), and `fvs.completed_timestamp`.
+  - **Future work (Open Item 3)**: extend `dom_mgr` to also read and publish the non-COR ELS per-lane fault/warn reason codes at pg1A bytes 212-219. Once landed, `FaultIndicationTask` picks them up automatically via the same `_FLAG_TO_TOKEN` loop.
   - No rows to create or delete. No cleanup logic. No behavioural change to the periodic 60 s poll loop.
 
 #### 7.3.1 Lifecycle & shutdown
@@ -216,83 +219,32 @@ Being killed mid-loop is safe because:
 | -- | ------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
 | 1  | pg0: byte 9 bits 0,2 (case-temp lo-alarm, hi-warn)     | Latched / COR                         | `CmisApi.get_module_level_flag()` -> `get_transceiver_dom_flags()`                                                    | `TRANSCEIVER_DOM_FLAG`          |
 | 2  | pg0: byte 11 bits 0-3 (Aux3 flags)                     | Latched / COR                         | Same as #1                                                                                                            | `TRANSCEIVER_DOM_FLAG`          |
-| 3  | pg0: byte 11 bits 4-7 (Custom Mon flags)               | Latched / COR                         | (a) `CmisApi.get_module_level_flag()` -> `custom_mon_*_flag` keys; (b) on CPO-ELS modules `NvidiaCpoElsCmisApi.get_els_dom_flags()` re-reads byte 11 -> `els_custom_mon_*` keys | `TRANSCEIVER_DOM_FLAG`          |
-| 4  | pg1A: byte 166 (FaultFlagLane bank 1)                  | Latched / COR                         | `elsfp_cmis.get_elsfp_status_flags()` (reads bytes 166-177) -> `get_transceiver_status_flags()`                       | `TRANSCEIVER_STATUS_FLAG`       |
-| 5  | pg1A: byte 174 (WarnFlagLane bank 1)                   | Latched per spec                      | Same call as #4                                                                                                       | `TRANSCEIVER_STATUS_FLAG`       |
-| 6  | pg1A: byte 190 (HighPowerAlarm)                        | Latched / COR                         | `elsfp_cmis.get_elsfp_lane_flags()` (reads bytes 186-219) -> `get_transceiver_dom_flags()`                            | `TRANSCEIVER_DOM_FLAG`          |
-| 7  | pg1A: byte 191 (LowPowerAlarm)                         | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_DOM_FLAG`          |
-| 8  | pg1A: byte 192 (HighPowerWarn)                         | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_DOM_FLAG`          |
-| 9  | pg1A: byte 193 (LowPowerWarn)                          | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_DOM_FLAG`          |
-| 10 | pg1A: bytes 212-219 (per-lane 4-bit fault/warn codes)  | Not spec-COR (read-only, non-latched) | **Direct EEPROM read** by `FaultIndicationTask` (see 7.4.1); the existing `elsfp_cmis.get_elsfp_fault_warning_codes()` -> `get_transceiver_status()` path is defined but not exercised on CPO today | Not read from STATE_DB (direct)  |
+| 3  | pg0: byte 11 bits 4-7 (Custom Mon flags)               | Latched / COR                         | (a) `CmisApi.get_module_level_flag()` -> `custom_mon_*_flag` keys; (b) on CPO-ELS modules `NvidiaCpoElsCmisApi.get_els_dom_flags()` re-reads byte 11 -> `els_custom_mon_*` keys | (a) `TRANSCEIVER_DOM_FLAG`; (b) `TRANSCEIVER_ELS_DOM_FLAG` |
+| 4  | pg1A: byte 166 (FaultFlagLane bank 1)                  | Latched / COR                         | `elsfp_cmis.get_elsfp_status_flags()` (reads bytes 166-177) -> `get_transceiver_status_flags()`                       | `TRANSCEIVER_ELS_STATUS_FLAG`   |
+| 5  | pg1A: byte 174 (WarnFlagLane bank 1)                   | Latched per spec                      | Same call as #4                                                                                                       | `TRANSCEIVER_ELS_STATUS_FLAG`   |
+| 6  | pg1A: byte 190 (HighPowerAlarm)                        | Latched / COR                         | `elsfp_cmis.get_elsfp_lane_flags()` (reads bytes 186-219) -> `get_transceiver_dom_flags()`                            | `TRANSCEIVER_ELS_DOM_FLAG`      |
+| 7  | pg1A: byte 191 (LowPowerAlarm)                         | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_ELS_DOM_FLAG`      |
+| 8  | pg1A: byte 192 (HighPowerWarn)                         | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_ELS_DOM_FLAG`      |
+| 9  | pg1A: byte 193 (LowPowerWarn)                          | Latched / COR                         | Same call as #6                                                                                                       | `TRANSCEIVER_ELS_DOM_FLAG`      |
+| 10 | pg1A: bytes 212-219 (per-lane 4-bit fault/warn codes)  | Not spec-COR (read-only, non-latched) | **Future work**: `dom_mgr` will add functionality to read these bytes and publish per-lane fields (via the existing `elsfp_cmis.get_elsfp_fault_warning_codes()` -> `get_transceiver_status()` path, currently defined but not exercised on CPO). Not consumed by this version of the feature; picked up automatically by `FaultIndicationTask` once the fields are added, via the same `_FLAG_TO_TOKEN` loop. See Open Item 3 for the alternative direct-EEPROM-read approach. | `TRANSCEIVER_ELS_STATUS_FLAG` (once `dom_mgr` adds the fields) |
 
 Consequence for this design:
 
-- Rows #1-9 (single-bit latched flags on COR pages): we consume the two existing STATE_DB tables `TRANSCEIVER_DOM_FLAG` and `TRANSCEIVER_STATUS_FLAG` that `dom_mgr` refreshes on demand.
-- Row #10 (4-bit reason codes on **non-COR** bytes): `FaultIndicationTask` reads pg1A bytes 212-219 **directly** from the module's EEPROM (see section 7.4.1). No new STATE_DB table is introduced.
-- No new STATE_DB flag table is introduced.
-- Our in-code maps are:
-  - `_FLAG_TO_TOKEN` — flag field name (from `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG`) -> `xcvr_cpo_*` token. All bit-level decoding stays inside `dom_mgr` / the CMIS APIs.
-  - `_ELS_CODE_TO_TOKEN` — `(numeric code, fault/warn)` -> `xcvr_cpo_*` token. Decoding of pg1A bytes 212-219 into per-lane codes happens in `FaultIndicationTask` (see 7.4.1).
+- Rows #1-9 (single-bit latched flags on COR pages): we consume the four STATE_DB tables `TRANSCEIVER_DOM_FLAG`, `TRANSCEIVER_STATUS_FLAG`, `TRANSCEIVER_ELS_DOM_FLAG`, and `TRANSCEIVER_ELS_STATUS_FLAG` that `dom_mgr` refreshes on demand. Module-level flags (pg0) land in the non-ELS tables; ELS-specific flags (pg1A via `elsfp_cmis` / `NvidiaCpoElsCmisApi`) land in the ELS tables.
+- Row #10 (4-bit reason codes on **non-COR** bytes): deferred. `dom_mgr` will add functionality to read pg1A bytes 212-219 and publish per-lane fields into `TRANSCEIVER_ELS_STATUS_FLAG` (exact field naming TBD in a follow-up revision). This feature will consume them automatically through the same `_FLAG_TO_TOKEN` loop once the fields exist — no code change needed on the fault-indication side. The alternative direct-EEPROM-read approach originally suggested for this row is retained in Open Item 3 as a fallback.
+- No new STATE_DB flag table is introduced by this feature (the two `TRANSCEIVER_ELS_*_FLAG` tables are owned by `dom_mgr`; their exact per-field schema is delivered in a follow-up revision).
+- Our in-code map is:
+  - `_FLAG_TO_TOKEN` — flag field name (from `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` / `TRANSCEIVER_ELS_DOM_FLAG` / `TRANSCEIVER_ELS_STATUS_FLAG`) -> `xcvr_cpo_*` token. All bit-level decoding stays inside `dom_mgr` / the CMIS APIs.
 
-#### 7.4.1 Direct read of non-COR ELS reason codes (pg1A:212-219)
+#### 7.4.1 `_FLAG_TO_TOKEN` mapping and parse loop
 
-Row #10 in the table above is intentionally read **directly** from EEPROM rather than through `dom_mgr` + STATE_DB. Rationale:
+The single in-code map that drives token emission is `_FLAG_TO_TOKEN` in `xcvr_fault.py`. Every field name that appears in any of the four STATE_DB flag tables and represents a fault has an entry here.
 
-- These bytes are **non-COR**: reading them does not clear anything. Two readers (any future `dom_mgr` read + our read) cannot race — so the single-reader invariant that motivates the rest of the design does not apply here.
-- The existing `dom_mgr` path for these codes (`get_transceiver_status()`) is defined but not exercised for CPO ports today. Getting it wired into `dom_mgr` + published on a new STATE_DB table would require a separate community HLD revision. That is a preferable long-term shape but not required for correctness given the non-COR property.
-- Doing the read locally in `FaultIndicationTask` after the DONE arrives adds one small EEPROM read per fault event (sub-millisecond); it keeps the whole feature landable inside `mlnx-platform-api` with no new cross-repo coordination.
-
-Extending `dom_mgr` to publish these codes (Option 1 in the design discussion) is **still under consideration** as a follow-up. For this version we go with the direct read (Option 2). See Open Item 5.
-
-The read + parse logic sits in `xcvr_fault.py` next to the flag-based path:
-
-```python
-_ELS_CODE_TO_TOKEN = {
-    # (code_value, kind) -> base token; lane index appended when emitting
-    (1, 'fault'): 'xcvr_cpo_els_apc_failure',
-    (2, 'fault'): 'xcvr_cpo_els_tec_failure',
-    (3, 'fault'): 'xcvr_cpo_els_laser_ramping_timeout',
-    (4, 'fault'): 'xcvr_cpo_els_fiber_check_failure',
-    (5, 'fault'): 'xcvr_cpo_els_laser_tuning_failure',
-    (1, 'warn'):  'xcvr_cpo_els_apc_warn',
-    # ... full listing per the Spectrum CPO doc appendix ...
-}
-
-def parse_els_fault_codes(sfp):
-    """Read pg 0x1A bytes 212-219 directly. Non-COR, safe alongside dom_mgr."""
-    raw = sfp._read_eeprom_page(page=0x1A, offset=212, num_bytes=8)
-    if raw is None:
-        return []
-    tokens = []
-    for lane_idx, byte in enumerate(raw, start=1):
-        fault_code = byte & 0x0F
-        warn_code  = (byte >> 4) & 0x0F
-        if fault_code:
-            base = _ELS_CODE_TO_TOKEN.get((fault_code, 'fault'))
-            if base:
-                tokens.append(f'{base}_lane{lane_idx}')
-        if warn_code:
-            base = _ELS_CODE_TO_TOKEN.get((warn_code, 'warn'))
-            if base:
-                tokens.append(f'{base}_lane{lane_idx}')
-    return tokens
-```
-
-The `FaultIndicationTask` response-phase handler calls both parsers and merges their outputs before writing:
-
-```python
-tokens = parse_and_tokenize(port)                    # from STATE_DB flag tables (rows #1-9)
-tokens += parse_els_fault_codes(sfp)                 # direct EEPROM read (row #10)
-if tokens:
-    logger.log_warning(...)
-    update_xcvr_fault_field(port, tokens)            # RMW union in TRANSCEIVER_STATUS_SW.xcvr_fault (single-writer)
-```
-
-Schematic of `_FLAG_TO_TOKEN` in `xcvr_fault.py`:
+Schematic (the exact per-field list for the two `TRANSCEIVER_ELS_*_FLAG` tables is delivered in a follow-up revision — this schematic uses illustrative names):
 
 ```python
 _FLAG_TO_TOKEN = {
-    # ---- from TRANSCEIVER_DOM_FLAG ----
+    # ---- from TRANSCEIVER_DOM_FLAG (pg0 module-level, non-ELS) ----
     'case_temp_low_alarm':               'xcvr_cpo_module_case_temp_low_alarm',
     'case_temp_high_warning':            'xcvr_cpo_module_case_temp_high_warning',
     'aux3_high_alarm':                   'xcvr_cpo_module_aux3_high_alarm',
@@ -303,6 +255,11 @@ _FLAG_TO_TOKEN = {
     'custom_mon_low_alarm':              'xcvr_cpo_module_custom_mon_low_alarm',
     'custom_mon_high_warning':           'xcvr_cpo_module_custom_mon_high_warning',
     'custom_mon_low_warning':            'xcvr_cpo_module_custom_mon_low_warning',
+
+    # ---- from TRANSCEIVER_STATUS_FLAG (pg0 module-level status, non-ELS) ----
+    # (fields TBD in a follow-up revision)
+
+    # ---- from TRANSCEIVER_ELS_DOM_FLAG (pg0 byte 11 bits 4-7 re-read on ELS + pg1A power alarms/warns) ----
     'els_custom_mon_high_alarm':         'xcvr_cpo_els_custom_mon_high_alarm',
     'els_custom_mon_low_alarm':          'xcvr_cpo_els_custom_mon_low_alarm',
     'els_custom_mon_high_warning':       'xcvr_cpo_els_custom_mon_high_warning',
@@ -311,21 +268,22 @@ _FLAG_TO_TOKEN = {
     'els_high_power_alarm_lane_2':       'xcvr_cpo_els_high_power_alarm_lane2',
     # ... one per lane per power fault type ...
 
-    # ---- from TRANSCEIVER_STATUS_FLAG ----
+    # ---- from TRANSCEIVER_ELS_STATUS_FLAG (pg1A per-lane fault/warn bank flags) ----
     'fault_flag_lane_1':                 'xcvr_cpo_els_fault_lane1',
     'fault_flag_lane_2':                 'xcvr_cpo_els_fault_lane2',
     'warn_flag_lane_1':                  'xcvr_cpo_els_warn_lane1',
     'warn_flag_lane_2':                  'xcvr_cpo_els_warn_lane2',
-    # ...
+    # ... and, once dom_mgr adds them, per-lane reason-code fields from pg1A:212-219 ...
 }
 ```
 
-Parse pseudocode:
+Parse pseudocode (one loop across all four tables):
 
 ```python
 def parse_and_tokenize(port):
     tokens = []
-    for tbl in (dom_flag_tbl, status_flag_tbl):
+    for tbl in (dom_flag_tbl, status_flag_tbl,
+                els_dom_flag_tbl, els_status_flag_tbl):
         row = tbl.get(port) or {}
         for field, value in row.items():
             if str(value).lower() in ('true', '1'):
@@ -333,6 +291,15 @@ def parse_and_tokenize(port):
                 if token:
                     tokens.append(token)
     return tokens
+```
+
+The `FaultIndicationTask` response-phase handler runs this parser once per logical port and writes the result:
+
+```python
+tokens = parse_and_tokenize(port)                    # from all four STATE_DB flag tables
+if tokens:
+    logger.log_warning(...)
+    update_xcvr_fault_field(port, tokens)            # RMW union in TRANSCEIVER_STATUS_SW.xcvr_fault (single-writer)
 ```
 
 Multiple simultaneous faults on the same port produce multiple tokens; they are joined with `|` when written to `TRANSCEIVER_STATUS_SW.xcvr_fault` (section 7.6.3).
@@ -359,18 +326,20 @@ sequenceDiagram
     CH->>FT: enqueue vmodule key
     FT->>FT: resolve vmodule to logical ports
     loop for each port in group
-        FT->>AD: NotificationProducer.send on REFRESH_COUNTERS_ON_DEMAND channel
+        FT->>AD: NotificationProducer.send on REFRESH_COUNTERS_ON_DEMAND channel (force=false)
     end
     AD-->>DM: NotificationConsumer wakes on the channel
-    DM->>SDK: COR-safe EEPROM read on the module
-    DM->>SD: refresh TRANSCEIVER_DOM_FLAG and TRANSCEIVER_STATUS_FLAG
-    DM->>AD: NotificationProducer.send on REFRESH_COUNTERS_ON_DEMAND_DONE channel
+    alt requested_timestamp > last_update_time OR force=true
+        DM->>SDK: COR-safe EEPROM read on the module
+        DM->>SD: refresh TRANSCEIVER_DOM_FLAG / TRANSCEIVER_STATUS_FLAG / TRANSCEIVER_ELS_DOM_FLAG / TRANSCEIVER_ELS_STATUS_FLAG
+    else fresh enough (force=false)
+        DM->>DM: skip EEPROM read (tables already fresh)
+    end
+    DM->>AD: NotificationProducer.send on REFRESH_COUNTERS_ON_DEMAND_DONE channel (fvs.status=OK)
     AD-->>FT: NotificationConsumer wakes on DONE channel
     loop for each port in group
-        FT->>SD: read DOM_FLAG and STATUS_FLAG
+        FT->>SD: read DOM_FLAG / STATUS_FLAG / ELS_DOM_FLAG / ELS_STATUS_FLAG
         FT->>FT: scan fields, name to token
-        FT->>SDK: direct EEPROM read pg1A bytes 212-219 (non-COR)
-        FT->>FT: parse per-lane codes, code to token
         FT->>FT: syslog WARNING
         FT->>SD: write xcvr_cpo tokens to TRANSCEIVER_STATUS_SW.xcvr_fault
     end
@@ -394,8 +363,9 @@ Message shape (using swsscommon's `NotificationProducer::send(op, data, fvs)` tr
 | Slot | Value | Purpose |
 | --- | --- | --- |
 | `op` (string) | logical port name, e.g. `Ethernet405` | Which logical port to refresh. `FaultIndicationTask` addresses only the **first split** of each of the vModule's physical ports (see requirement 6). |
-| `fvs.requested_tables` | `TRANSCEIVER_DOM_FLAG,TRANSCEIVER_STATUS_FLAG` | Comma-separated STATE_DB tables `dom_mgr` should refresh. Unknown names are silently ignored. |
-| `fvs.timestamp` | `Wed Jul 08 15:08:00 2026` | UTC timestamp using the DOM `get_current_time()` format (`"%a %b %d %H:%M:%S %Y"`), copied verbatim into DONE for correlation. |
+| `fvs.requested_tables` | `TRANSCEIVER_DOM_FLAG,TRANSCEIVER_STATUS_FLAG,TRANSCEIVER_ELS_DOM_FLAG,TRANSCEIVER_ELS_STATUS_FLAG` | Comma-separated STATE_DB tables `dom_mgr` should refresh. Unknown names are silently ignored. |
+| `fvs.force` | `false` (default) / `true` | Whether `dom_mgr` should skip its freshness check. When `false`, `dom_mgr` compares `fvs.timestamp` with the per-table `last_update_time` in the requested STATE_DB tables and **skips** the on-demand EEPROM read if `last_update_time > timestamp` (the tables are already fresher than the caller needs). When `true`, `dom_mgr` performs the EEPROM read regardless of the freshness comparison. **`FaultIndicationTask` always sends `force=false`** — if `dom_mgr` has already refreshed the tables since the interrupt fired, re-reading is unnecessary. The `force=true` path is defined for future callers that need to bypass the freshness check; it is not exercised by this feature. |
+| `fvs.timestamp` | `Wed Jul 08 15:08:00 2026` | UTC timestamp using the DOM `get_current_time()` format (`"%a %b %d %H:%M:%S %Y"`), captured by `FaultIndicationTask` when it processes the interrupt. Used by `dom_mgr` for the freshness comparison above (when `force=false`) and copied verbatim into DONE for correlation. |
 
 The `data` string of `NotificationProducer::send(op, data, fvs)` is not used on requests; senders pass an empty string.
 
@@ -404,14 +374,18 @@ The `data` string of `NotificationProducer::send(op, data, fvs)` is not used on 
 | Slot | Value | Purpose |
 | --- | --- | --- |
 | `op` (string) | logical port name | Which port the completion is for. |
-| `data` (string) | `OK` / `PARTIAL` / `ERROR:<reason>` | Outcome. `PARTIAL` = at least one requested table was unknown and skipped, the others succeeded. |
+| `fvs.status` (string) | `OK` / `PARTIAL` / `ERROR:<reason>` | Outcome. `PARTIAL` = at least one requested table was unknown and skipped, the others succeeded. `OK` also covers the "skipped, already fresh" case (see `force` above). |
 | `fvs.requested_timestamp` | copied verbatim from request | Correlation with the originating request. |
-| `fvs.completed_timestamp` | current UTC time | When `dom_mgr` finished the on-demand read. |
+| `fvs.completed_timestamp` | current UTC time | When `dom_mgr` finished the on-demand read (or decided to skip because the tables were already fresh). |
+
+The `data` string of `NotificationProducer::send(op, data, fvs)` is not used on DONE either; senders pass an empty string. Status information is carried in `fvs.status`.
 
 #### 7.6.2 Existing STATE_DB tables (read-only for this feature)
 
-- `TRANSCEIVER_DOM_FLAG|<logical_port>` — dom_mgr writes it; we read every field on DONE.
-- `TRANSCEIVER_STATUS_FLAG|<logical_port>` — same.
+- `TRANSCEIVER_DOM_FLAG|<logical_port>` — dom_mgr writes it; we read every field on DONE. Module-level (pg0) DOM flags — case-temp, aux3, custom mon.
+- `TRANSCEIVER_STATUS_FLAG|<logical_port>` — dom_mgr writes it; we read every field on DONE. Module-level (pg0) status flags.
+- `TRANSCEIVER_ELS_DOM_FLAG|<logical_port>` — dom_mgr writes it; we read every field on DONE. ELS DOM flags (pg0 byte 11 bits 4-7 re-read on CPO-ELS, plus pg1A power alarm/warn bytes 190-193). Per-field schema delivered in a follow-up revision.
+- `TRANSCEIVER_ELS_STATUS_FLAG|<logical_port>` — dom_mgr writes it; we read every field on DONE. ELS status flags (pg1A per-lane fault/warn bank bytes 166 and 174; and eventually the per-lane reason codes from pg1A:212-219 — see row #10 in section 7.4 and Open Item 3). Per-field schema delivered in a follow-up revision.
 
 #### 7.6.3 Existing STATE_DB row, one new field for this feature
 
@@ -553,22 +527,21 @@ Unit tests added to `sonic-buildimage/platform/mellanox/mlnx-platform-api/tests/
 2. **Registration on a non-CPO platform**: build an `_sfp_list` of regular `Sfp` instances only; assert no interrupt fd is registered and `FaultIndicationTask` is never constructed. Only the existing plug-event fds are present.
 3. **Lazy spawn**: simulate the first `POLLPRI` on a CpoPort interrupt fd; assert `FaultIndicationTask` is constructed and `start()`ed exactly once. A second interrupt does not spawn a second thread.
 4. **Enqueue on interrupt**: simulate `POLLPRI`; assert the CpoPort reference lands on the task's work queue and `Chassis.get_change_event()` returns without doing any EEPROM read.
-5. **vModule REFRESH fan-out (first split only)**: mock a vModule whose 4 physical ports are each broken out into two logical ports (Ethernet0/4, Ethernet8/12, Ethernet16/20, Ethernet24/28). Assert `FaultIndicationTask._send_request()` sends exactly **4** notifications on the `REFRESH_COUNTERS_ON_DEMAND` channel, addressed to Ethernet0, Ethernet8, Ethernet16, Ethernet24 (the first splits), all with the same timestamp. Assert that no notification is sent for Ethernet4, Ethernet12, Ethernet20, Ethernet28.
-6. **vModule write fan-out (all splits)**: same breakout mock as UT 5, and mocked `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` rows populated for every logical port after the DONE. Assert `FaultIndicationTask` writes `xcvr_fault` for all **8** logical ports (Ethernet0, Ethernet4, Ethernet8, Ethernet12, Ethernet16, Ethernet20, Ethernet24, Ethernet28), each row receiving the same token set. Validates requirement 9's write-side fan-out.
-7. **DONE consumption**: mock a DONE notification for one of the ports (`op=Ethernet0`, `data=OK`, `fvs.requested_timestamp=<matching>`); assert the parse+write pipeline runs and tokens are computed from the mocked `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` rows.
-8. **`_FLAG_TO_TOKEN` coverage**: for every field in `_FLAG_TO_TOKEN`, set the corresponding value to `"true"` in the mocked flag tables and assert the matching `xcvr_cpo_*` token appears in the write to `TRANSCEIVER_STATUS_SW.xcvr_fault`.
-9. **Direct read of pg1A:212-219**: mock `sfp._read_eeprom_page(0x1A, 212, 8)` to return per-lane bytes with specific fault/warn nibble values. Assert `parse_els_fault_codes()` returns the expected `xcvr_cpo_els_*_laneN` tokens per `_ELS_CODE_TO_TOKEN`. Cover: (a) all zero bytes → empty list, (b) fault-only, warn-only, both set, (c) unknown code value → not emitted, (d) all 8 lanes populated.
-10. **Multiple simultaneous faults**: set multiple flag fields to `"true"` at once **and** populate pg1A:212-219 with codes; assert all tokens (flag-derived and code-derived) are joined with `|` in the `xcvr_fault` field.
-11. **Sticky union across calls**: pre-populate `xcvr_fault` with `xcvr_cpo_module_case_temp_high_warning` (from a prior write). Trigger the flow with `xcvr_cpo_els_high_power_alarm_lane2` as the newly-computed token. Assert the final `xcvr_fault` value is the union `xcvr_cpo_module_case_temp_high_warning|xcvr_cpo_els_high_power_alarm_lane2` — both preserved.
-12. **Same fault re-asserts, no duplication**: pre-populate `xcvr_fault` with `xcvr_cpo_XXX`. Trigger the flow twice with the same token `xcvr_cpo_XXX`. Assert the final `xcvr_fault` value is still exactly `xcvr_cpo_XXX` (not `xcvr_cpo_XXX|xcvr_cpo_XXX`). Assert that the syslog WARNING was emitted **on every triggering** — the warning fires even though the write is a no-op.
-13. **Non-interference with `error`**: pre-populate `error` with `"Blocking error code 5"` (written by xcvrd in a mock). Trigger the flow; assert `error` is left completely untouched and `xcvr_fault` gets only the `xcvr_cpo_*` tokens. Validates requirement 9 (single-writer, single-field).
-14. **No auto-clear**: after tokens are written, simulate a subsequent DONE where every flag is `"false"`. Assert the tokens in `xcvr_fault` are unchanged.
-15. **Timeout**: send a request notification; do not deliver DONE within 20 s (mocked clock); assert a WARNING is logged and no tokens are written for that port.
-16. **Duplicate request**: trigger two interrupts on the same vModule within 500 ms of each other; assert two request notifications are sent with different `timestamp` values (T1, T2), and that each incoming DONE is matched to its originating in-flight request by comparing `requested_timestamp` — the T1-DONE clears the T1 waiter, the T2-DONE clears the T2 waiter.
-17. **Daemon thread + test-only stop**: assert `FaultIndicationTask.daemon is True` immediately after `Chassis` spawns it. Call the test-only `request_stop()`, assert the internal stop event is set and `join()` returns within `POLL_TIMEOUT_MS + margin`. No `atexit` registration to verify.
+5. **vModule REFRESH fan-out (first split only)**: mock a vModule whose 4 physical ports are each broken out into two logical ports (Ethernet0/4, Ethernet8/12, Ethernet16/20, Ethernet24/28). Assert `FaultIndicationTask._send_request()` sends exactly **4** notifications on the `REFRESH_COUNTERS_ON_DEMAND` channel, addressed to Ethernet0, Ethernet8, Ethernet16, Ethernet24 (the first splits), all with the same timestamp and all carrying `fvs.force = "false"` and `fvs.requested_tables` listing all four flag tables (`TRANSCEIVER_DOM_FLAG,TRANSCEIVER_STATUS_FLAG,TRANSCEIVER_ELS_DOM_FLAG,TRANSCEIVER_ELS_STATUS_FLAG`). Assert that no notification is sent for Ethernet4, Ethernet12, Ethernet20, Ethernet28.
+6. **vModule write fan-out (all splits)**: same breakout mock as UT 5, and mocked `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG` / `TRANSCEIVER_ELS_DOM_FLAG` / `TRANSCEIVER_ELS_STATUS_FLAG` rows populated for every logical port after the DONE. Assert `FaultIndicationTask` writes `xcvr_fault` for all **8** logical ports (Ethernet0, Ethernet4, Ethernet8, Ethernet12, Ethernet16, Ethernet20, Ethernet24, Ethernet28), each row receiving the same token set. Validates requirement 9's write-side fan-out.
+7. **DONE consumption**: mock a DONE notification for one of the ports (`op=Ethernet0`, `fvs.status=OK`, `fvs.requested_timestamp=<matching>`); assert the parse+write pipeline runs and tokens are computed from the mocked four flag-table rows.
+8. **`_FLAG_TO_TOKEN` coverage**: for every field in `_FLAG_TO_TOKEN`, set the corresponding value to `"true"` in the appropriate mocked flag table (module-level fields in `TRANSCEIVER_DOM_FLAG` / `TRANSCEIVER_STATUS_FLAG`; ELS fields in `TRANSCEIVER_ELS_DOM_FLAG` / `TRANSCEIVER_ELS_STATUS_FLAG`) and assert the matching `xcvr_cpo_*` token appears in the write to `TRANSCEIVER_STATUS_SW.xcvr_fault`.
+9. **Multiple simultaneous faults**: set multiple flag fields to `"true"` at once across all four tables; assert all tokens are joined with `|` in the `xcvr_fault` field.
+10. **Sticky union across calls**: pre-populate `xcvr_fault` with `xcvr_cpo_module_case_temp_high_warning` (from a prior write). Trigger the flow with `xcvr_cpo_els_high_power_alarm_lane2` as the newly-computed token. Assert the final `xcvr_fault` value is the union `xcvr_cpo_module_case_temp_high_warning|xcvr_cpo_els_high_power_alarm_lane2` — both preserved.
+11. **Same fault re-asserts, no duplication**: pre-populate `xcvr_fault` with `xcvr_cpo_XXX`. Trigger the flow twice with the same token `xcvr_cpo_XXX`. Assert the final `xcvr_fault` value is still exactly `xcvr_cpo_XXX` (not `xcvr_cpo_XXX|xcvr_cpo_XXX`). Assert that the syslog WARNING was emitted **on every triggering** — the warning fires even though the write is a no-op.
+12. **Non-interference with `error`**: pre-populate `error` with `"Blocking error code 5"` (written by xcvrd in a mock). Trigger the flow; assert `error` is left completely untouched and `xcvr_fault` gets only the `xcvr_cpo_*` tokens. Validates requirement 9 (single-writer, single-field).
+13. **No auto-clear**: after tokens are written, simulate a subsequent DONE where every flag across all four tables is `"false"`. Assert the tokens in `xcvr_fault` are unchanged.
+14. **Timeout**: send a request notification; do not deliver DONE within 20 s (mocked clock); assert a WARNING is logged and no tokens are written for that port.
+15. **Duplicate request**: trigger two interrupts on the same vModule within 500 ms of each other; assert two request notifications are sent with different `timestamp` values (T1, T2), and that each incoming DONE is matched to its originating in-flight request by comparing `requested_timestamp` — the T1-DONE clears the T1 waiter, the T2-DONE clears the T2 waiter.
+16. **Daemon thread + test-only stop**: assert `FaultIndicationTask.daemon is True` immediately after `Chassis` spawns it. Call the test-only `request_stop()`, assert the internal stop event is set and `join()` returns within `POLL_TIMEOUT_MS + margin`. No `atexit` registration to verify.
 
 ## 14. Open/Action items
 
 1. **`dom_mgr` on-demand poll API** — needs sign-off from the dom_mgr owner: the two new APPL_DB `NotificationConsumer` / `NotificationProducer` channels (`REFRESH_COUNTERS_ON_DEMAND` / `_DONE`), the message format (`op` / `data` / `fvs` triple), and reuse of the existing link-change-fast-path infrastructure for the on-demand poll.
 2. **DONE-wait timeout value** — currently set to 20 s. Confirm with the dom_mgr owner that 20 s is a safe upper bound for a single on-demand poll of the CPO flag pages and not overly generous. If typical latency is tens to hundreds of ms as expected, tighten the timeout accordingly. Also confirm the current no-retry policy on timeout (log WARNING and skip) or specify a retry strategy.
-3. **Direct EEPROM read of pg1A:212-219 vs. `dom_mgr` publication** (see 7.4.1) — for row #10 (non-COR reason codes) this design reads EEPROM directly from `FaultIndicationTask`. The alternative (extend `dom_mgr` to publish these codes to a new STATE_DB table, then consume via the existing `REFRESH_COUNTERS_ON_DEMAND` channel) is architecturally cleaner but requires a community HLD revision. **Option 1 is still under consideration** as a follow-up; for this version we go with the direct read. Revisit once the community mechanism is landed and there is a second consumer that would benefit from a shared STATE_DB publication.
+3. **`dom_mgr` publication of pg1A:212-219 reason codes** (row #10 in section 7.4) — the current design defers reading these non-COR per-lane fault/warn reason codes to `dom_mgr`. `dom_mgr` will add functionality to read pg1A:212-219 via the existing `elsfp_cmis.get_elsfp_fault_warning_codes()` -> `get_transceiver_status()` path and publish per-lane fields into `TRANSCEIVER_ELS_STATUS_FLAG`. Once landed, `FaultIndicationTask` picks the fields up automatically through the same `_FLAG_TO_TOKEN` loop — no code change on the fault-indication side. Open questions: exact per-lane field names, exact target table (`TRANSCEIVER_ELS_STATUS_FLAG` assumed), timing of the `dom_mgr` addition, and whether it lands in the same PR as the base feature or a follow-up. The **first suggestion** (fallback if `dom_mgr` cannot take this on in time) — kept here for reference — was to have `FaultIndicationTask` read pg1A:212-219 **directly** from EEPROM after the DONE arrives, using a local `_ELS_CODE_TO_TOKEN = {(code, kind): base_token, ...}` map and appending `_laneN`. This is safe because pg1A:212-219 is non-COR (no two-readers race), but it puts EEPROM I/O in `mlnx-platform-api` which the rest of this design deliberately avoids. Chosen approach: wait for `dom_mgr` to publish; revert to the direct-read fallback only if `dom_mgr` cannot land the addition in time.
